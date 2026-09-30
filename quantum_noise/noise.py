@@ -111,14 +111,19 @@ class CorrelatedNoiseGroup:
 
     ``sites`` are ``(after_gate, qubit)`` pairs in temporal order.  Error
     occurrences follow a two-state Markov chain with marginal probability
-    ``probability`` and adjacent-site Pearson correlation ``correlation``:
+    ``probability``.  The Pearson correlation of errors separated by a time
+    interval ``delta_t`` is ``time_correlation ** delta_t``; when explicit
+    ``times`` (or a schedule) are not supplied the legacy step-index model
+    ``correlation`` is used, i.e. adjacent sites are one step apart:
 
     * P(error at t+1 | error at t)    = p + c * (1 - p)
     * P(error at t+1 | no error at t) = p * (1 - c)
 
-    Correlations between sites separated by k steps decay as c**k.  The joint
-    trajectory distribution is enumerated exactly by the simulator; it is
-    never replaced by independent per-site sampling.
+    Changing the duration of operations or inserting idle waits changes the
+    elapsed time between sites and therefore the joint distribution, even
+    though the operation sequence is identical.  The joint trajectory
+    distribution is enumerated exactly by the simulator; it is never replaced
+    by independent per-site sampling.
     """
 
     channel: str
@@ -126,6 +131,8 @@ class CorrelatedNoiseGroup:
     probability: float = 0.0
     correlation: float = 0.0
     name: str = "correlated"
+    time_correlation: Optional[float] = None
+    times: Optional[tuple[float, ...]] = None
 
     def __post_init__(self) -> None:
         if self.channel not in _CORRELATED_ERROR_OPERATORS:
@@ -147,6 +154,33 @@ class CorrelatedNoiseGroup:
             raise ValueError(
                 f"correlation must be in [{lower:.6g}, 1] for p={p:g}"
             )
+        if self.time_correlation is not None and not 0.0 <= float(self.time_correlation) <= 1.0:
+            raise ValueError("time_correlation must be in [0, 1]")
+        if self.times is not None:
+            times = tuple(float(t) for t in self.times)
+            if len(times) != len(self.sites):
+                raise ValueError("explicit times must match the number of sites")
+            if any(times[i] >= times[i + 1] for i in range(len(times) - 1)):
+                raise ValueError("site times must be strictly increasing")
+
+    @property
+    def uses_time(self) -> bool:
+        return self.time_correlation is not None or self.times is not None
+
+    def site_times(self, schedule=None) -> Optional[tuple[float, ...]]:
+        """Absolute time of every site under an explicit schedule, if known."""
+        if self.times is not None:
+            return tuple(float(t) for t in self.times)
+        if schedule is None or self.time_correlation is None:
+            return None
+        return tuple(schedule.site_time(int(site[0])) for site in self.sites)
+
+    @staticmethod
+    def transition_probabilities(p: float, correlation: float) -> tuple[float, float]:
+        """Return (P(error|previous error), P(error|previous no error))."""
+        stay_error = min(1.0, max(0.0, p + correlation * (1.0 - p)))
+        become_error = min(1.0, max(0.0, p * (1.0 - correlation)))
+        return stay_error, become_error
 
     @property
     def error_operator(self) -> Matrix:
@@ -155,9 +189,7 @@ class CorrelatedNoiseGroup:
     def trajectories(self) -> list[tuple[tuple[int, ...], float]]:
         """Enumerate (error pattern, joint probability) pairs exactly."""
         p = self.probability
-        c = self.correlation
-        stay_error = p + c * (1.0 - p)
-        become_error = p * (1.0 - c)
+        intervals = self._step_intervals()
         results: list[tuple[tuple[int, ...], float]] = [((), 1.0)]
         for site_index in range(len(self.sites)):
             next_results: list[tuple[tuple[int, ...], float]] = []
@@ -165,12 +197,23 @@ class CorrelatedNoiseGroup:
                 if site_index == 0:
                     p_error = p
                 else:
+                    correlation = self._interval_correlation(intervals[site_index - 1])
+                    stay_error, become_error = self.transition_probabilities(p, correlation)
                     p_error = stay_error if pattern[-1] == 1 else become_error
-                p_error = min(1.0, max(0.0, p_error))
                 next_results.append((pattern + (1,), weight * p_error))
                 next_results.append((pattern + (0,), weight * (1.0 - p_error)))
             results = next_results
         return [(pattern, weight) for pattern, weight in results if weight > 0.0]
+
+    def _step_intervals(self) -> tuple[float, ...]:
+        if self.times is not None:
+            return tuple(self.times[i + 1] - self.times[i] for i in range(len(self.times) - 1))
+        return tuple(1.0 for _ in range(len(self.sites) - 1))
+
+    def _interval_correlation(self, delta_time: float) -> float:
+        if self.time_correlation is None:
+            return self.correlation
+        return float(self.time_correlation) ** max(0.0, float(delta_time))
 
     def to_dict(self) -> dict:
         return {
@@ -179,6 +222,8 @@ class CorrelatedNoiseGroup:
             "sites": [list(site) for site in self.sites],
             "probability": self.probability,
             "correlation": self.correlation,
+            "time_correlation": self.time_correlation,
+            "times": list(self.times) if self.times is not None else None,
         }
 
     @staticmethod
@@ -189,6 +234,16 @@ class CorrelatedNoiseGroup:
             probability=float(data["probability"]),
             correlation=float(data.get("correlation", 0.0)),
             name=data.get("name", "correlated"),
+            time_correlation=(
+                float(data["time_correlation"])
+                if data.get("time_correlation") is not None
+                else None
+            ),
+            times=(
+                tuple(float(v) for v in data["times"])
+                if data.get("times") is not None
+                else None
+            ),
         )
 
 

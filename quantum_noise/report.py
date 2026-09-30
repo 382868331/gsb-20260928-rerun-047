@@ -23,6 +23,19 @@ def format_run_report(run: BatchRun) -> str:
             for entry in run.noise_trajectories
         )
         lines.insert(3 if len(lines) > 3 else len(lines), f"noise trajectories: {summary}")
+    if run.schedule_name is not None:
+        lines.insert(1, f"schedule={run.schedule_name}")
+    if run.measurement_conditions:
+        conditions = ", ".join(
+            f"{condition}:{count}"
+            for condition, count in sorted(run.measurement_conditions.items())
+        )
+        lines.append(f"measurement conditions: {conditions}")
+    if run.noise_paths:
+        paths = ", ".join(
+            f"{label}:{count}" for label, count in sorted(run.noise_paths.items())
+        )
+        lines.append(f"sampled environment paths: {paths}")
     for outcome in outcomes:
         test = run.difference_tests.get(outcome)
         verdict = test.interpretation if test else "not tested"

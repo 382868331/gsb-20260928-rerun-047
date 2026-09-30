@@ -10,6 +10,45 @@ from .experiments import ExperimentBatch, rerun_archive, run_batch, save_batch_a
 from .gates import Circuit
 from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule
 from .report import format_batch_report
+from .schedule import Schedule
+
+
+def build_timing_batches(
+    shots: int, seed: int, noise: float, time_correlation: float
+) -> list[ExperimentBatch]:
+    """Same rx(pi/2) rx(pi/2) operations under tight and spaced timings.
+
+    The spaced schedule inserts a long idle wait between the two noise sites,
+    so the time-correlated environment is much less correlated even though the
+    operation sequence is identical.
+    """
+
+    circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+    batches = []
+    for label, idle in (("tight", 0.0), ("spaced", 8.0)):
+        schedule = Schedule((1.0, 1.0), (idle, 0.0), name=label)
+        group = CorrelatedNoiseGroup(
+            channel="bit_flip",
+            sites=((0, 0), (1, 0)),
+            probability=noise,
+            time_correlation=time_correlation,
+            name=f"time-correlated-{label}",
+        )
+        batches.append(
+            ExperimentBatch(
+                circuit=circuit,
+                noise_model=NoiseModel(
+                    f"timing-{label}-p{noise:g}-tc{time_correlation:g}",
+                    (),
+                    (group,),
+                ),
+                shots=shots,
+                base_seed=seed,
+                name=f"timing-{label}",
+                schedule=schedule,
+            )
+        )
+    return batches
 
 
 def build_batch(
@@ -67,7 +106,9 @@ def build_batch(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Small quantum noise research experiments")
-    parser.add_argument("--preset", choices=("single", "bell", "corr"), default="single")
+    parser.add_argument(
+        "--preset", choices=("single", "bell", "corr", "timing"), default="single"
+    )
     parser.add_argument("--shots", type=int, default=1000)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=20260929)
@@ -77,6 +118,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=0.0,
         help="time-correlation strength for the 'corr' preset (0 = independent)",
+    )
+    parser.add_argument(
+        "--time-correlation",
+        type=float,
+        default=0.5,
+        help="per-unit-time correlation for the 'timing' preset (0 = instant decay)",
     )
     parser.add_argument(
         "--ordering",
@@ -91,6 +138,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.verify is not None:
         runs = rerun_archive(args.verify)
     else:
+        if args.preset == "timing":
+            runs = []
+            for batch in build_timing_batches(
+                args.shots, args.seed, args.noise, args.time_correlation
+            ):
+                batch_runs = run_batch(batch, repeats=args.repeats)
+                if args.output is not None:
+                    target = args.output.with_name(
+                        f"{args.output.stem}-{batch.name}{args.output.suffix}"
+                    )
+                    save_batch_archive(target, batch, batch_runs)
+                runs.extend(batch_runs)
+            print(format_batch_report(runs))
+            return 0
         ordering = (
             "early"
             if args.ordering == "after" and args.preset == "bell"

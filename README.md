@@ -12,7 +12,11 @@
 - 随机性可追溯：相关噪声批次中，每个 shot 先按 `noise_seed` 抽噪声轨迹、再按 `measure_seed` 抽测量结果，两种随机性分开追溯、分别可复现；运行结果记录噪声轨迹分布。
 - 状态校验：每次模拟检查迹、Hermitian 性、正半定性和测量概率归一。
 - 并排检查：同一线路同时输出理想与有噪精确概率、采样计数和差异解释。
- - 批次复现：保存线路（含测量与条件）、噪声设定（含相关组）、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。归档为 schema 2，旧的 schema 1 独立噪声实验仍可读取并重放。
+ - 批次复现：保存线路（含测量与条件）、噪声设定（含相关组）、时间安排、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。归档为 schema 3，旧的 schema 1/2 实验仍可读取并重放。
+- 持续时间环境扰动：`Schedule` 为每个操作指定持续时间与其后的空闲等待；`CorrelatedNoiseGroup(time_correlation=...)` 让错误事件的 Pearson 相关按经过时间 `time_correlation ** delta_t` 衰减。同一操作序列在不同时间安排（含中途空闲区间）下是不同实验，联合噪声轨迹不同。
+- 分支独立的环境延续：中途测量分裂出的每个经典分支各自延续自己的两态环境；两个分支不会因为后续操作数量相同就被认为经历了相同扰动。
+- 环境、测量条件与统计分开保存：每个 run 同时归档精确环境路径（标签、所属测量分支、联合概率、条件测量分布）、测量分支计数（`measurement_conditions`）与采样环境路径计数（`noise_paths`）。
+- 暂停/恢复重放：`ResumableBatchRun` 按段推进 shot 并把噪声/测量两条 RNG 流的状态写入 `BatchCheckpoint`；在中途测量或空闲区间后暂停，恢复后继续执行，结果与一次性运行逐 shot 一致。交错执行多个批次不会改变各自结果。
 - 保守统计：使用精确概率计算期望计数；样本不足或稀有事件标记为 `inconclusive`。若精确概率无差异，采样波动不会被报告成确定噪声效果。
 
 ## 直接运行
@@ -21,6 +25,7 @@
 python examples/single_qubit_ordering.py
 python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
+python examples/timing_schedules.py
 ```
 
 命令行示例：
@@ -29,6 +34,7 @@ python examples/correlated_strength_sweep.py
 python -m quantum_noise.cli --preset single --shots 2000 --seed 20260929 --ordering ad-bf
 python -m quantum_noise.cli --preset bell --shots 2000 --seed 20260929 --ordering late --output batch.json
 python -m quantum_noise.cli --preset corr --noise 0.2 --correlation 0.8 --shots 2000
+python -m quantum_noise.cli --preset timing --noise 0.2 --time-correlation 0.5 --shots 2000
 python -m quantum_noise.cli --verify batch.json
 ```
 
@@ -64,4 +70,33 @@ print(run.ideal_probabilities, run.noisy_probabilities)
 
 ```bash
 python -m unittest discover -s tests -v
+```
+
+## 时间安排与暂停恢复示例
+
+```python
+from quantum_noise import Circuit, CorrelatedNoiseGroup, NoiseModel, ExperimentBatch, ResumableBatchRun
+from quantum_noise.schedule import Schedule
+
+circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+schedule = Schedule((1.0, 1.0), (8.0, 0.0), name="spaced")
+group = CorrelatedNoiseGroup(
+    channel="bit_flip",
+    sites=((0, 0), (1, 0)),
+    probability=0.2,
+    time_correlation=0.5,
+)
+batch = ExperimentBatch(
+    circuit=circuit,
+    noise_model=NoiseModel("spaced", (), (group,)),
+    shots=2000,
+    base_seed=20261001,
+    name="spaced",
+    schedule=schedule,
+)
+
+runner = ResumableBatchRun(batch)
+runner.advance(500)          # 在任意 shot 边界暂停（含中途测量/空闲区间之后）
+checkpoint = runner.checkpoint()
+# ...之后用 ResumableBatchRun.restore(batch, checkpoint) 恢复并完成剩余 shot
 ```
