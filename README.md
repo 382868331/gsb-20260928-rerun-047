@@ -10,6 +10,9 @@
 - 时间相关噪声：`CorrelatedNoiseGroup` 用两态马尔可夫链耦合多个线路位置的错误事件，相关强度 `correlation` 从 0（独立）到 1（完全相关）；联合噪声轨迹被精确枚举并加权混合，绝不用独立重复抽样代替相关过程。
 - 中途测量与条件操作：`Circuit.measure(qubit, cbit)` 在经典寄存器上分裂分支，`Circuit.apply(..., condition=(cbit, value))` 只在匹配分支上作用。
 - 随机性可追溯：相关噪声批次中，每个 shot 先按 `noise_seed` 抽噪声轨迹、再按 `measure_seed` 抽测量结果，两种随机性分开追溯、分别可复现；运行结果记录噪声轨迹分布。
+- 时间安排与持续扰动：`TimeSchedule` 为每个操作和随后的空闲区间指定时间；相关组使用有限 `correlation_time`，相关随两次环境事件的实际间隔指数衰减。
+- 分支独立环境：中途测量后的每个经典分支单独延续环境状态；条件门被跳过时，不会只因为分支操作数量相同就共享扰动历史。
+- 可恢复批次：时间表对照分别保存环境变化、测量条件和统计结果；单批次与多批次检查点可在中途测量或空闲暂停后恢复，改变套件执行顺序不改变各批次结果。
 - 状态校验：每次模拟检查迹、Hermitian 性、正半定性和测量概率归一。
 - 并排检查：同一线路同时输出理想与有噪精确概率、采样计数和差异解释。
  - 批次复现：保存线路（含测量与条件）、噪声设定（含相关组）、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。归档为 schema 2，旧的 schema 1 独立噪声实验仍可读取并重放。
@@ -21,6 +24,7 @@
 python examples/single_qubit_ordering.py
 python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
+python examples/time_schedule_comparison.py
 ```
 
 命令行示例：
@@ -31,6 +35,27 @@ python -m quantum_noise.cli --preset bell --shots 2000 --seed 20260929 --orderin
 python -m quantum_noise.cli --preset corr --noise 0.2 --correlation 0.8 --shots 2000
 python -m quantum_noise.cli --verify batch.json
 ```
+
+### 时间安排对照
+
+```python
+schedule = TimeSchedule(
+    operation_durations=(0.0, 0.0),
+    idle_after=(0.0, 20.0),
+    name="long-idle",
+)
+group = CorrelatedNoiseGroup(
+    channel="bit_flip",
+    sites=((0, 0), (1, 0)),
+    probability=0.2,
+    correlation=1.0,
+    correlation_time=1.0,
+)
+batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 20261001,
+                        name="long-idle", schedule=schedule)
+```
+
+`compare_schedules` 用同一操作序列生成多个独立命名批次；`save_schedule_comparison` 为每个时间安排分别写入环境变化、测量条件与统计结果。`start_resumable_batch`/`resume_batch` 和 `BatchCheckpoint.resume(..., order=[...])` 用于暂停恢复和检查执行顺序无关性。
 
 ## 最小代码示例
 

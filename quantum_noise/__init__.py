@@ -1,8 +1,20 @@
 """A small repeatable quantum-noise research toolkit."""
 
-from .experiments import BatchRun, ExperimentBatch, run_batch, save_batch_archive
+from .experiments import (
+    BatchCheckpoint,
+    BatchRun,
+    ExperimentBatch,
+    ExperimentTask,
+    ResumableBatch,
+    compare_schedules,
+    resume_batch,
+    run_batch,
+    save_batch_archive,
+    save_schedule_comparison,
+    start_resumable_batch,
+)
 from .gates import Circuit, bell_circuit, ghz_circuit
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule
+from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
 from .simulator import (
     NoiseTrajectory,
     SimulationResult,
@@ -23,6 +35,12 @@ __all__ = [
     "NoiseRule",
     "NoiseTrajectory",
     "ProportionEstimate",
+    "TimeSchedule",
+    "BatchCheckpoint",
+    "ExperimentTask",
+    "ResumableBatch",
+    "compare_schedules",
+    "resume_batch",
     "bell_circuit",
     "compare_counts",
     "compare_ideal_and_noisy",
@@ -32,6 +50,8 @@ __all__ = [
     "sample_counts",
     "sample_counts_trajectory",
     "save_batch_archive",
+    "save_schedule_comparison",
+    "start_resumable_batch",
     "simulate",
     "SimulationResult",
 ]

@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import product
 from math import sqrt
 from typing import Optional, Sequence
 
 from .gates import Circuit
 from .linalg import Matrix, dagger, embedding, matmul, trace, zeros
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule
+from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,9 @@ class SimulationResult:
     probabilities: dict[str, float]
     classical_probabilities: dict[str, float] | None = None
     noise_trajectories: tuple["NoiseTrajectory", ...] | None = None
+    environment_records: tuple[dict[str, object], ...] | None = None
+    measurement_conditions: tuple[dict[str, object], ...] | None = None
+    schedule: TimeSchedule | None = None
 
     @property
     def trace(self) -> complex:
@@ -38,6 +41,8 @@ class NoiseTrajectory:
     label: str
     probability: float
     outcome_probabilities: dict[str, float]
+    branch: str = ""
+    environment_states: dict[str, list[int]] = field(default_factory=dict)
 
 
 def zero_state(num_qubits: int) -> Matrix:
@@ -47,18 +52,44 @@ def zero_state(num_qubits: int) -> Matrix:
     return state
 
 
-def simulate(circuit: Circuit, noise_model: Optional[NoiseModel] = None) -> SimulationResult:
+def simulate(
+    circuit: Circuit,
+    noise_model: Optional[NoiseModel] = None,
+    schedule: Optional[TimeSchedule] = None,
+) -> SimulationResult:
     rules = list(noise_model.rules if noise_model is not None else [])
     groups = list(noise_model.groups if noise_model is not None else [])
+    if schedule is not None:
+        schedule = schedule.normalized(len(circuit.operations))
     _validate_rules(circuit, rules)
     _validate_groups(circuit, groups)
 
     if not groups:
-        state, classical = _evolve(circuit, rules, {})
+        state, classical = _evolve(circuit, rules, {}, schedule=schedule)
+        environment_records = None
+        measurement_conditions = None
+        if schedule is not None or any(op.name == "measure" for op in circuit.operations):
+            registers = _possible_registers(circuit)
+            measurement_conditions = tuple(
+                _measurement_conditions(circuit, register) for register in registers
+            ) or None
+            environment_records = tuple(
+                {
+                    "branch": "".join(str(bit) for bit in register),
+                    "probability": 1.0 if not register else None,
+                    "measurement_conditions": _measurement_conditions(circuit, register),
+                    "schedule": schedule.to_dict() if schedule is not None else None,
+                    "events": _rule_environment_events(circuit, rules, schedule),
+                }
+                for register in _possible_registers(circuit)
+            )
         result = SimulationResult(
             state=state,
             probabilities=measurement_probabilities(state, circuit.num_qubits),
             classical_probabilities=classical,
+            environment_records=environment_records,
+            measurement_conditions=measurement_conditions,
+            schedule=schedule,
         )
         validate_density_matrix(result.state)
         return result
@@ -67,25 +98,47 @@ def simulate(circuit: Circuit, noise_model: Optional[NoiseModel] = None) -> Simu
     # trajectory applies its error pattern deterministically; the final state
     # is the probability-weighted sum, so correlations are never replaced by
     # independent per-site sampling.
-    combined = _combined_trajectories(groups)
+    registers = [
+        register
+        for register in _possible_registers(circuit)
+        if _branch_probability(circuit, register, schedule) > 1e-15
+    ]
+    measurement_conditions = tuple(
+        _measurement_conditions(circuit, register) for register in registers
+    )
+    combined = _combined_branch_trajectories(circuit, groups, schedule)
     size = 2**circuit.num_qubits
     state = zeros(size, size)
     classical_total: dict[str, float] = {}
     trajectories: list[NoiseTrajectory] = []
-    for pattern, weight, events in combined:
-        branch_state, classical = _evolve(circuit, rules, events)
+    environment_records: list[dict[str, object]] = []
+    for branch, pattern, weight, events, environment_states, record in combined:
+        branch_state, classical = _evolve(
+            circuit,
+            rules,
+            {branch: events},
+            schedule=schedule,
+            only_branch=branch,
+        )
         for row in range(size):
             for col in range(size):
                 state[row][col] += weight * branch_state[row][col]
         for key, value in classical.items():
             classical_total[key] = classical_total.get(key, 0.0) + weight * value
+        record_with_probability = dict(record)
+        record_with_probability["probability"] = weight
+        environment_records.append(record_with_probability)
         trajectories.append(
             NoiseTrajectory(
-                label="".join(str(bit) for bit in pattern),
+                label=f"{branch}:{pattern}" if branch else pattern,
                 probability=weight,
                 outcome_probabilities=measurement_probabilities(
                     branch_state, circuit.num_qubits
-                ),
+                )
+                if trace(branch_state).real > 1e-15
+                else {},
+                branch=branch,
+                environment_states=environment_states,
             )
         )
 
@@ -94,14 +147,163 @@ def simulate(circuit: Circuit, noise_model: Optional[NoiseModel] = None) -> Simu
         probabilities=measurement_probabilities(state, circuit.num_qubits),
         classical_probabilities=classical_total or None,
         noise_trajectories=tuple(trajectories),
+        environment_records=tuple(environment_records),
+        measurement_conditions=measurement_conditions or None,
+        schedule=schedule,
     )
     validate_density_matrix(result.state)
     return result
 
 
+def _possible_registers(circuit: Circuit) -> list[tuple[int, ...]]:
+    cbit_count = 0
+    for operation in circuit.operations:
+        if operation.name == "measure" and operation.cbit is not None:
+            cbit_count = max(cbit_count, operation.cbit + 1)
+    if cbit_count == 0:
+        return [()]
+    return [
+        tuple(int(bit) for bit in format(value, f"0{cbit_count}b"))
+        for value in range(2**cbit_count)
+    ]
+
+
+def _branch_probability(
+    circuit: Circuit, register: tuple[int, ...], schedule: Optional[TimeSchedule]
+) -> float:
+    if not register:
+        return 1.0
+    state, _classical = _evolve(
+        circuit,
+        [],
+        {},
+        schedule=schedule,
+        only_branch="".join(str(bit) for bit in register),
+    )
+    return trace(state).real
+
+
+def _register_matches(register: tuple[int, ...], condition: tuple[int, int]) -> bool:
+    cbit, value = condition
+    return cbit < len(register) and register[cbit] == value
+
+
+def _experienced_indices(
+    circuit: Circuit,
+    register: tuple[int, ...],
+    groups: Sequence[CorrelatedNoiseGroup],
+    schedule: Optional[TimeSchedule],
+) -> list[list[int]]:
+    active = set(range(len(circuit.operations)))
+    for index, operation in enumerate(circuit.operations):
+        if (
+            operation.condition is not None
+            and not _register_matches(register, operation.condition)
+        ):
+            active.discard(index)
+    result = []
+    for group in groups:
+        indices = [
+            index
+            for index, (after_gate, _qubit) in enumerate(group.sites)
+            if after_gate in active
+        ]
+        result.append(indices)
+    return result
+
+
+def _measurement_conditions(
+    circuit: Circuit, register: tuple[int, ...]
+) -> dict[str, object]:
+    values = {str(index): int(value) for index, value in enumerate(register)}
+    operations = []
+    for index, operation in enumerate(circuit.operations):
+        if operation.name == "measure":
+            value = int(register[operation.cbit]) if operation.cbit < len(register) else 0
+            operations.append(
+                {
+                    "operation": index,
+                    "qubit": operation.qubits[0],
+                    "cbit": operation.cbit,
+                    "value": value,
+                }
+            )
+    return {"register": values, "operations": operations}
+
+
+def _rule_environment_events(
+    circuit: Circuit,
+    rules: Sequence[NoiseRule],
+    schedule: Optional[TimeSchedule],
+) -> list[dict[str, object]]:
+    events = []
+    for rule in rules:
+        if rule.after_gate is None:
+            continue
+        events.append(
+            {
+                "site": [rule.after_gate, rule.qubits[0]],
+                "time": schedule.event_time(rule.after_gate) if schedule is not None else None,
+                "channel": rule.channel,
+                "probability": rule.probability,
+            }
+        )
+    return events
+
+
+def _combined_branch_trajectories(
+    circuit: Circuit,
+    groups: Sequence[CorrelatedNoiseGroup],
+    schedule: Optional[TimeSchedule],
+) -> list[
+    tuple[
+        str,
+        str,
+        float,
+        dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+        dict[str, list[int]],
+        dict[str, object],
+    ]
+]:
+    combined = []
+    for branch in _possible_registers(circuit):
+        branch_key = "".join(str(bit) for bit in branch)
+        experienced = _experienced_indices(circuit, branch, groups, schedule)
+        for pattern, weight, events, states, records in _combined_trajectories(
+            groups, experienced, schedule
+        ):
+            combined.append(
+                (
+                    branch_key,
+                    pattern,
+                    weight,
+                    events,
+                    states,
+                    {
+                        "branch": branch_key,
+                        "pattern": pattern,
+                        "environment_states": states,
+                        "measurement_conditions": _measurement_conditions(circuit, branch),
+                        "events": records,
+                    },
+                )
+            )
+    return combined
+
+
 def _combined_trajectories(
     groups: Sequence[CorrelatedNoiseGroup],
-) -> list[tuple[tuple[int, ...], float, dict[int, list[tuple[Matrix, tuple[int, ...]]]]]]:
+    experienced_by_group: list[list[int]],
+    schedule: Optional[TimeSchedule],
+) -> list[
+    tuple[
+        str,
+        float,
+        dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+        dict[str, list[int]],
+        dict[str, list[dict]],
+    ]
+]:
     """Combine per-group Markov trajectories into joint error events.
 
     Groups are mutually independent; sites inside one group are correlated.
@@ -110,37 +312,97 @@ def _combined_trajectories(
     """
 
     per_group = []
-    for group in groups:
+    for group_index, group in enumerate(groups):
         entries = []
-        for pattern, weight in group.trajectories():
+        experienced_indices = experienced_by_group[group_index]
+        for pattern, weight, transitions in _group_trajectories(
+            group, experienced_indices, schedule
+        ):
             events: dict[int, list[tuple[Matrix, tuple[int, ...]]]] = {}
-            for site, bit in zip(group.sites, pattern):
+            for site_index, bit in zip(experienced_indices, pattern):
+                site = group.sites[site_index]
                 if bit:
                     after_gate, qubit = site
                     events.setdefault(after_gate, []).append(
                         (group.error_operator, (qubit,))
                     )
-            entries.append((pattern, weight, events))
+            entries.append((pattern, weight, events, transitions))
         per_group.append(entries)
 
     combined = []
     for choices in product(*per_group):
-        pattern: tuple[int, ...] = ()
+        pattern_parts: list[str] = []
         weight = 1.0
         events: dict[int, list[tuple[Matrix, tuple[int, ...]]]] = {}
-        for choice_pattern, choice_weight, choice_events in choices:
-            pattern += choice_pattern
+        environment_states: dict[str, list[int]] = {}
+        event_records: dict[str, list[dict]] = {}
+        for group, choice in zip(groups, choices):
+            choice_pattern, choice_weight, choice_events, transitions = choice
+            pattern_parts.append("".join(str(bit) for bit in choice_pattern))
             weight *= choice_weight
             for index, operators in choice_events.items():
                 events.setdefault(index, []).extend(operators)
-        combined.append((pattern, weight, events))
+            environment_states[group.name] = list(choice_pattern)
+            event_records[group.name] = transitions
+        combined.append(
+            (
+                "-".join(pattern_parts),
+                weight,
+                events,
+                environment_states,
+                event_records,
+            )
+        )
     return combined
+
+
+def _group_trajectories(
+    group: CorrelatedNoiseGroup,
+    experienced_indices: Sequence[int],
+    schedule: Optional[TimeSchedule],
+) -> list[tuple[tuple[int, ...], float, list[dict]]]:
+    p = group.probability
+    results: list[tuple[tuple[int, ...], float, list[dict]]] = [((), 1.0, [])]
+    previous_time: Optional[float] = None
+    previous_site: Optional[tuple[int, int]] = None
+    for site_index in experienced_indices:
+        after_gate, qubit = group.sites[site_index]
+        current_time = None if schedule is None else schedule.event_time(after_gate)
+        elapsed = None if previous_time is None or current_time is None else current_time - previous_time
+        correlation = group.correlation_after(elapsed)
+        stay_error = min(1.0, max(0.0, p + correlation * (1.0 - p)))
+        become_error = min(1.0, max(0.0, p * (1.0 - correlation)))
+        next_results = []
+        for pattern, old_weight, history in results:
+            p_error = p if not pattern else (stay_error if pattern[-1] else become_error)
+            for bit, transition_probability in ((1, p_error), (0, 1.0 - p_error)):
+                record = {
+                    "site": [after_gate, qubit],
+                    "time": current_time,
+                    "elapsed": elapsed,
+                    "correlation": correlation,
+                    "state": bit,
+                    "previous_site": list(previous_site) if previous_site is not None else None,
+                }
+                next_results.append(
+                    (
+                        pattern + (bit,),
+                    old_weight * transition_probability,
+                    history + [record],
+                    )
+                )
+        results = next_results
+        previous_time = current_time
+        previous_site = (after_gate, qubit)
+    return [(pattern, weight, history) for pattern, weight, history in results if weight > 0.0]
 
 
 def _evolve(
     circuit: Circuit,
     rules: Sequence[NoiseRule],
-    error_events: dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+    error_events: dict[str, dict[int, list[tuple[Matrix, tuple[int, ...]]]]] | dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+    schedule: Optional[TimeSchedule] = None,
+    only_branch: str = "",
 ) -> tuple[Matrix, dict[str, float]]:
     """Propagate branch states through gates, measurements and noise.
 
@@ -154,11 +416,16 @@ def _evolve(
         (zero_state(circuit.num_qubits), ())
     ]
 
-    def apply_noise(state: Matrix, index: Optional[int]) -> Matrix:
+    def apply_noise(state: Matrix, index: Optional[int], register: tuple[int, ...]) -> Matrix:
         for rule in rules:
             if rule.after_gate == index:
                 state = _apply_rule(state, rule, circuit.num_qubits)
-        for operator, qubits in error_events.get(index, ()):  # type: ignore[arg-type]
+        if error_events and not isinstance(next(iter(error_events)), int):
+            branch_key = "".join(str(bit) for bit in register)
+            branch_events = error_events.get(branch_key, {})  # type: ignore[union-attr]
+        else:
+            branch_events = error_events  # type: ignore[assignment]
+        for operator, qubits in branch_events.get(index, ()):  # type: ignore[union-attr]
             unitary = embedding(operator, qubits, circuit.num_qubits)
             state = _apply_unitary(state, unitary)
         return state
@@ -174,21 +441,26 @@ def _evolve(
                 continue
             if operation.condition is not None:
                 cbit, value = operation.condition
-                if cbit >= len(register) or register[cbit] != value:
+                if not _register_matches(register, (cbit, value)):
                     next_branches.append((state, register))
                     continue
             unitary = embedding(operation.matrix, operation.qubits, circuit.num_qubits)
             next_branches.append((_apply_unitary(state, unitary), register))
         branches = [
-            (apply_noise(state, index), register) for state, register in next_branches
+            (apply_noise(state, index, register), register) for state, register in next_branches
         ]
 
-    branches = [(apply_noise(state, None), register) for state, register in branches]
+    branches = [
+        (apply_noise(state, None, register), register) for state, register in branches
+    ]
 
     size = 2**circuit.num_qubits
     final = zeros(size, size)
     classical: dict[str, float] = {}
     for state, register in branches:
+        branch_key = "".join(str(bit) for bit in register)
+        if only_branch and branch_key != only_branch:
+            continue
         weight = trace(state).real
         for row in range(size):
             for col in range(size):
@@ -222,9 +494,11 @@ def _measure(
 
 
 def compare_ideal_and_noisy(
-    circuit: Circuit, noise_model: NoiseModel
+    circuit: Circuit, noise_model: NoiseModel, schedule: Optional[TimeSchedule] = None
 ) -> tuple[SimulationResult, SimulationResult]:
-    return simulate(circuit), simulate(circuit, noise_model)
+    return simulate(circuit, schedule=schedule), simulate(
+        circuit, noise_model, schedule=schedule
+    )
 
 
 def _apply_unitary(state: Matrix, unitary: Matrix) -> Matrix:

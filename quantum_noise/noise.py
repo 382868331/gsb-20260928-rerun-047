@@ -10,7 +10,7 @@ independent errors; c -> 1 makes errors at adjacent sites coincide.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import sqrt
+from math import exp, sqrt, inf
 from typing import Optional, Sequence
 
 from .gates import I, X, Y, Z
@@ -106,6 +106,69 @@ _CORRELATED_ERROR_OPERATORS = {
 
 
 @dataclass(frozen=True)
+class TimeSchedule:
+    """Physical timing of circuit operations and subsequent idle intervals.
+
+    Both sequences are indexed by circuit operation.  A correlated event at
+    ``after_gate=i`` happens after ``operation_durations[i]`` and
+    ``idle_after[i]`` have elapsed, so the same circuit can be compared under
+    different timings without changing its gate sequence.
+    """
+
+    operation_durations: tuple[float, ...] = ()
+    idle_after: tuple[float, ...] = ()
+    name: str = "schedule"
+
+    def __post_init__(self) -> None:
+        if not self.operation_durations:
+            raise ValueError("time schedule must contain at least one operation")
+        if any(float(value) < 0.0 for value in self.operation_durations):
+            raise ValueError("operation durations must be nonnegative")
+        if any(float(value) < 0.0 for value in self.idle_after):
+            raise ValueError("idle durations must be nonnegative")
+
+    @property
+    def num_operations(self) -> int:
+        return len(self.operation_durations)
+
+    def normalized(self, num_operations: int) -> "TimeSchedule":
+        if self.operation_durations and len(self.operation_durations) != num_operations:
+            raise ValueError("schedule does not match circuit operation count")
+        idle = list(self.idle_after)
+        if len(idle) > num_operations:
+            raise ValueError("schedule contains too many idle intervals")
+        idle.extend([0.0] * (num_operations - len(idle)))
+        if not self.operation_durations:
+            durations = [1.0] * num_operations
+        else:
+            durations = [float(value) for value in self.operation_durations]
+        return TimeSchedule(tuple(durations), tuple(idle), self.name)
+
+    def event_time(self, after_gate: int) -> float:
+        """Return the time at the end of operation ``after_gate`` and its idle gap."""
+        if not 0 <= after_gate < self.num_operations:
+            raise ValueError("operation index is outside schedule")
+        return sum(self.operation_durations[: after_gate + 1]) + sum(
+            self.idle_after[: after_gate + 1]
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "operation_durations": list(self.operation_durations),
+            "idle_after": list(self.idle_after),
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "TimeSchedule":
+        return TimeSchedule(
+            operation_durations=tuple(float(v) for v in data.get("operation_durations", ())),
+            idle_after=tuple(float(v) for v in data.get("idle_after", ())),
+            name=data.get("name", "schedule"),
+        )
+
+
+@dataclass(frozen=True)
 class CorrelatedNoiseGroup:
     """A time-correlated error process across several circuit positions.
 
@@ -126,6 +189,7 @@ class CorrelatedNoiseGroup:
     probability: float = 0.0
     correlation: float = 0.0
     name: str = "correlated"
+    correlation_time: float = inf
 
     def __post_init__(self) -> None:
         if self.channel not in _CORRELATED_ERROR_OPERATORS:
@@ -147,6 +211,16 @@ class CorrelatedNoiseGroup:
             raise ValueError(
                 f"correlation must be in [{lower:.6g}, 1] for p={p:g}"
             )
+        if self.correlation_time <= 0.0:
+            raise ValueError("correlation_time must be positive")
+
+    def correlation_after(self, elapsed_time: Optional[float]) -> float:
+        """Correlation across an elapsed physical time gap."""
+        if elapsed_time is None or self.correlation_time == inf:
+            return self.correlation
+        if elapsed_time < 0.0:
+            raise ValueError("elapsed time must be nonnegative")
+        return self.correlation * exp(-float(elapsed_time) / self.correlation_time)
 
     @property
     def error_operator(self) -> Matrix:
@@ -179,6 +253,7 @@ class CorrelatedNoiseGroup:
             "sites": [list(site) for site in self.sites],
             "probability": self.probability,
             "correlation": self.correlation,
+            "correlation_time": None if self.correlation_time == inf else self.correlation_time,
         }
 
     @staticmethod
@@ -189,6 +264,9 @@ class CorrelatedNoiseGroup:
             probability=float(data["probability"]),
             correlation=float(data.get("correlation", 0.0)),
             name=data.get("name", "correlated"),
+            correlation_time=float(data.get("correlation_time", inf))
+            if data.get("correlation_time") is not None
+            else inf,
         )
 
 

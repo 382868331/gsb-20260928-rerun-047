@@ -23,6 +23,13 @@ def format_run_report(run: BatchRun) -> str:
             for entry in run.noise_trajectories
         )
         lines.insert(3 if len(lines) > 3 else len(lines), f"noise trajectories: {summary}")
+    if run.schedule is not None:
+        lines.append(
+            "schedule: operations="
+            f"{list(run.schedule.operation_durations)} idle_after={list(run.schedule.idle_after)}"
+        )
+    if run.environment_changes is not None:
+        lines.append(f"environment records: {len(run.environment_changes)}")
     for outcome in outcomes:
         test = run.difference_tests.get(outcome)
         verdict = test.interpretation if test else "not tested"

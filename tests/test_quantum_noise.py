@@ -4,14 +4,20 @@ from math import pi
 from pathlib import Path
 
 from quantum_noise.experiments import (
+    BatchCheckpoint,
     ExperimentBatch,
+    ExperimentTask,
+    compare_schedules,
     load_batch,
     rerun_archive,
+    resume_batch,
     run_batch,
     save_batch_archive,
+    save_schedule_comparison,
+    start_resumable_batch,
 )
-from quantum_noise.gates import Circuit, X, bell_circuit
-from quantum_noise.noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule
+from quantum_noise.gates import Circuit, X, Z, bell_circuit
+from quantum_noise.noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
 from quantum_noise.simulator import simulate, validate_density_matrix
 
 
@@ -300,7 +306,160 @@ class CorrelatedBatchTests(unittest.TestCase):
             self.assertEqual(loaded_batch.noise_model.groups, ())
             self.assertEqual(len(saved_runs), 1)
             reproduced = rerun_archive(path)
-        self.assertEqual(runs[0].noisy_counts, reproduced[0].noisy_counts)
+            self.assertEqual(runs[0].noisy_counts, reproduced[0].noisy_counts)
+
+
+class TimeScheduleTests(unittest.TestCase):
+    def test_same_operations_different_timings_change_correlation(self):
+        circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+        group = CorrelatedNoiseGroup(
+            "bit_flip",
+            ((0, 0), (1, 0)),
+            probability=0.2,
+            correlation=1.0,
+            correlation_time=1.0,
+        )
+        model = NoiseModel("time", (), (group,))
+        tight = TimeSchedule((0.0, 0.0), (0.0, 0.0), "tight")
+        relaxed = TimeSchedule((1.0, 20.0), (0.0, 0.0), "relaxed")
+        tight_result = simulate(circuit, model, tight)
+        relaxed_result = simulate(circuit, model, relaxed)
+        self.assertAlmostEqual(tight_result.probabilities["0"], 0.0)
+        self.assertAlmostEqual(relaxed_result.probabilities["0"], 0.32, places=6)
+        effective = tight_result.environment_records[0]["events"][group.name][1]["correlation"]
+        self.assertAlmostEqual(effective, 1.0)
+        relaxed_effective = relaxed_result.environment_records[0]["events"][group.name][1]["correlation"]
+        self.assertAlmostEqual(relaxed_effective, 0.0, places=5)
+
+    def test_short_circuit_direct_extreme_correlation_and_independence(self):
+        circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+        p = 0.25
+        group = CorrelatedNoiseGroup(
+            "bit_flip",
+            ((0, 0), (1, 0)),
+            probability=p,
+            correlation=1.0,
+            correlation_time=1.0,
+        )
+        model = NoiseModel("extremes", (), (group,))
+        fully_correlated = simulate(circuit, model, TimeSchedule((0.0, 0.0), name="tight"))
+        independent = simulate(circuit, model, TimeSchedule((1.0, 100.0), name="long-gap"))
+        direct_correlated_p0 = 0.0
+        direct_independent_p0 = 2.0 * p * (1.0 - p)
+        self.assertAlmostEqual(fully_correlated.probabilities["0"], direct_correlated_p0)
+        self.assertAlmostEqual(independent.probabilities["0"], direct_independent_p0, places=5)
+
+    def test_schedule_comparison_is_saved_with_separate_records_and_statistics(self):
+        circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+        group = CorrelatedNoiseGroup(
+            "bit_flip",
+            ((0, 0), (1, 0)),
+            probability=0.2,
+            correlation=1.0,
+            correlation_time=1.0,
+        )
+        model = NoiseModel("time", (), (group,))
+        schedules = {
+            "tight": TimeSchedule((1.0, 1.0), name="tight"),
+            "long-idle": TimeSchedule((1.0, 1.0), (0.0, 20.0), "long-idle"),
+        }
+        results = compare_schedules(circuit, model, schedules, shots=128, base_seed=31)
+        batches = {name: run[0].schedule and ExperimentBatch(
+            circuit=circuit,
+            noise_model=model,
+            shots=128,
+            base_seed=31,
+            name=name,
+            schedule=schedules[name],
+        ) for name, run in results.items()}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "comparison.json"
+            save_schedule_comparison(path, batches, results)
+            payload = __import__("json").loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(set(payload["schedules"]), {"tight", "long-idle"})
+        for name in schedules:
+            entry = payload["schedules"][name]
+            self.assertTrue(entry["environment_changes"][0])
+            self.assertTrue(entry["measurement_conditions"] or entry["statistics"])
+            self.assertTrue(entry["statistics"][0]["noisy_counts"])
+        self.assertNotEqual(
+            results["tight"][0].noisy_probabilities,
+            results["long-idle"][0].noisy_probabilities,
+        )
+
+
+class BranchEnvironmentTests(unittest.TestCase):
+    def test_measurement_branches_continue_environments_independently(self):
+        # Each post-measurement branch experiences its own later site, but
+        # both have the same number of environment events.
+        circuit = Circuit(1).h(0).measure(0, 0)
+        circuit.apply("x", X, 0, condition=(0, 0))
+        circuit.apply("z", Z, 0, condition=(0, 1))
+        group = CorrelatedNoiseGroup(
+            "bit_flip",
+            ((0, 0), (2, 0), (3, 0)),
+            probability=0.5,
+            correlation=1.0,
+            name="branch-env",
+        )
+        result = simulate(circuit, NoiseModel("branches", (), (group,)))
+        branches = {record["branch"]: record for record in result.environment_records}
+        self.assertEqual(set(branches), {"0", "1"})
+        self.assertEqual(len(branches["0"]["events"]["branch-env"]), 2)
+        self.assertEqual(len(branches["1"]["events"]["branch-env"]), 2)
+        self.assertAlmostEqual(result.probabilities["1"], 0.5)
+
+
+class CheckpointTests(unittest.TestCase):
+    def test_batch_resumes_and_replays_same_batch(self):
+        circuit = Circuit(1).h(0).h(0)
+        batch = ExperimentBatch(
+            circuit,
+            NoiseModel("simple", [NoiseRule("bit_flip", 0.1, (0,), after_gate=1)]),
+            shots=64,
+            base_seed=88,
+            name="checkpointed",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "batch-checkpoint.json"
+            paused = start_resumable_batch(path, batch, repeats=3, pause_after_idle=True)
+            self.assertEqual(len(paused.runs), 1)
+            resumed = resume_batch(path)
+            self.assertEqual(len(resumed.runs), 3)
+            expected = run_batch(batch, repeats=3)
+            self.assertEqual([r.noisy_counts for r in resumed.runs],
+                             [r.noisy_counts for r in expected])
+
+    def test_checkpoint_execution_order_does_not_change_results(self):
+        def make_batch(name: str, noise: float) -> ExperimentBatch:
+            return ExperimentBatch(
+                Circuit(1).h(0).h(0),
+                NoiseModel(name, [NoiseRule("bit_flip", noise, (0,), after_gate=1)]),
+                shots=96,
+                base_seed=44,
+                name=name,
+            )
+
+        tasks = [
+            ExperimentTask(make_batch("a", 0.1), 2, "a"),
+            ExperimentTask(make_batch("b", 0.2), 1, "b"),
+        ]
+        direct = {task.task_key: run_batch(task.batch, task.repeats) for task in tasks}
+        with tempfile.TemporaryDirectory() as directory:
+            first_path = Path(directory) / "first.json"
+            first = BatchCheckpoint(first_path).resume(tasks, order=["a", "b"], pause_after="a")
+            first = BatchCheckpoint.load(first_path).resume(tasks, order=["a", "b"])
+            second_path = Path(directory) / "second.json"
+            second = BatchCheckpoint(second_path).resume(tasks, order=["b", "a"])
+        for key in ("a", "b"):
+            self.assertEqual(
+                [r.noisy_counts for r in first[key]],
+                [r.noisy_counts for r in direct[key]],
+            )
+            self.assertEqual(
+                [r.noisy_counts for r in second[key]],
+                [r.noisy_counts for r in direct[key]],
+            )
 
 
 if __name__ == "__main__":
