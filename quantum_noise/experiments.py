@@ -11,8 +11,11 @@ from typing import Any, Optional
 
 from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
 from .noise import NoiseModel
-from .simulator import compare_ideal_and_noisy, sample_counts
+from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
+
+
+ARCHIVE_SCHEMA_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -46,6 +49,9 @@ class BatchRun:
     ideal_estimates: dict[str, ProportionEstimate]
     noisy_estimates: dict[str, ProportionEstimate]
     difference_tests: dict[str, DifferenceTest]
+    noise_seed: Optional[int] = None
+    measure_seed: Optional[int] = None
+    noise_trajectories: Optional[list[dict[str, Any]]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -72,6 +78,9 @@ class BatchRun:
                 }
                 for outcome, test in self.difference_tests.items()
             },
+            "noise_seed": self.noise_seed,
+            "measure_seed": self.measure_seed,
+            "noise_trajectories": self.noise_trajectories,
         }
 
 
@@ -79,12 +88,40 @@ def run_batch(
     batch: ExperimentBatch, repeats: int = 1, outcomes: Optional[list[str]] = None
 ) -> list[BatchRun]:
     ideal_result, noisy_result = compare_ideal_and_noisy(batch.circuit, batch.noise_model)
+    correlated = bool(batch.noise_model.groups)
+    trajectory_records = None
+    if correlated:
+        trajectory_records = [
+            {
+                "label": trajectory.label,
+                "probability": trajectory.probability,
+                "outcome_probabilities": trajectory.outcome_probabilities,
+            }
+            for trajectory in noisy_result.noise_trajectories or ()
+        ]
     runs: list[BatchRun] = []
     for index, seed in enumerate(batch.seeds(repeats)):
         ideal_rng_seed = _derive_seed(seed, b"ideal")
-        noisy_rng_seed = _derive_seed(seed, b"noisy")
         ideal_counts = sample_counts(ideal_result.probabilities, batch.shots, ideal_rng_seed)
-        noisy_counts = sample_counts(noisy_result.probabilities, batch.shots, noisy_rng_seed)
+        if correlated:
+            # Correlated batches sample the joint noise trajectory and the
+            # measurement outcome from separately seeded streams, keeping the
+            # two sources of randomness individually reproducible.
+            noise_seed = _derive_seed(seed, b"noise")
+            measure_seed = _derive_seed(seed, b"measure")
+            noisy_counts = sample_counts_trajectory(
+                noisy_result.noise_trajectories or (),
+                batch.shots,
+                noise_seed=noise_seed,
+                measure_seed=measure_seed,
+            )
+        else:
+            noise_seed = None
+            measure_seed = None
+            noisy_rng_seed = _derive_seed(seed, b"noisy")
+            noisy_counts = sample_counts(
+                noisy_result.probabilities, batch.shots, noisy_rng_seed
+            )
         tests = compare_counts(
             ideal_counts,
             noisy_counts,
@@ -106,6 +143,9 @@ def run_batch(
                 ideal_estimates=proportions(ideal_counts, ideal_result.probabilities),
                 noisy_estimates=proportions(noisy_counts, noisy_result.probabilities),
                 difference_tests=tests,
+                noise_seed=noise_seed,
+                measure_seed=measure_seed,
+                noise_trajectories=trajectory_records,
             )
         )
     return runs
@@ -122,7 +162,7 @@ def save_batch_archive(
     runs: list[BatchRun],
 ) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
         "batch": {
             "name": batch.name,
             "shots": batch.shots,
@@ -137,7 +177,7 @@ def save_batch_archive(
 
 def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
+    if payload.get("schema_version") not in (1, ARCHIVE_SCHEMA_VERSION):
         raise ValueError("unsupported batch archive schema")
     data = payload["batch"]
     batch = ExperimentBatch(
@@ -166,14 +206,25 @@ def rerun_archive(path: str | Path) -> list[BatchRun]:
 def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
     operations = []
     for operation in circuit.operations:
+        if operation.name == "measure":
+            operations.append(
+                {
+                    "name": "measure",
+                    "qubits": list(operation.qubits),
+                    "angle": None,
+                    "cbit": operation.cbit,
+                }
+            )
+            continue
         kind, angle = _operation_kind_and_angle(operation.name)
-        operations.append(
-            {
-                "name": kind,
-                "qubits": list(operation.qubits),
-                "angle": angle,
-            }
-        )
+        entry: dict[str, Any] = {
+            "name": kind,
+            "qubits": list(operation.qubits),
+            "angle": angle,
+        }
+        if operation.condition is not None:
+            entry["condition"] = list(operation.condition)
+        operations.append(entry)
     return {"num_qubits": circuit.num_qubits, "operations": operations}
 
 
@@ -182,10 +233,19 @@ def circuit_from_dict(data: dict[str, Any]) -> Circuit:
     for item in data["operations"]:
         name = item["name"]
         qubits = tuple(item["qubits"])
+        if name == "measure":
+            circuit.measure(qubits[0], int(item["cbit"]))
+            continue
         angle = item.get("angle")
+        condition = item.get("condition")
         matrix = _gate_matrix(name, angle)
         operation_name = f"{name}({angle:.12g})" if angle is not None else name
-        circuit.apply(operation_name, matrix, qubits)
+        circuit.apply(
+            operation_name,
+            matrix,
+            qubits,
+            condition=tuple(condition) if condition is not None else None,
+        )
     return circuit
 
 

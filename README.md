@@ -6,10 +6,13 @@
 
 - 小规模线路：单量子比特门、`RX/RY/RZ`、`CNOT`、`CZ`、`SWAP`。
 - 物理噪声：`bit_flip`、`phase_flip`、`depolarizing`、`amplitude_damping`、通用 Pauli 通道。
-- 顺序有效：`NoiseRule(after_gate=...)` 按线路门索引插入；同一位置的多条规则按列表顺序执行。
+ - 顺序有效：`NoiseRule(after_gate=...)` 按线路门索引插入；同一位置的多条规则按列表顺序执行。
+- 时间相关噪声：`CorrelatedNoiseGroup` 用两态马尔可夫链耦合多个线路位置的错误事件，相关强度 `correlation` 从 0（独立）到 1（完全相关）；联合噪声轨迹被精确枚举并加权混合，绝不用独立重复抽样代替相关过程。
+- 中途测量与条件操作：`Circuit.measure(qubit, cbit)` 在经典寄存器上分裂分支，`Circuit.apply(..., condition=(cbit, value))` 只在匹配分支上作用。
+- 随机性可追溯：相关噪声批次中，每个 shot 先按 `noise_seed` 抽噪声轨迹、再按 `measure_seed` 抽测量结果，两种随机性分开追溯、分别可复现；运行结果记录噪声轨迹分布。
 - 状态校验：每次模拟检查迹、Hermitian 性、正半定性和测量概率归一。
 - 并排检查：同一线路同时输出理想与有噪精确概率、采样计数和差异解释。
-- 批次复现：保存线路、噪声设定、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。
+ - 批次复现：保存线路（含测量与条件）、噪声设定（含相关组）、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。归档为 schema 2，旧的 schema 1 独立噪声实验仍可读取并重放。
 - 保守统计：使用精确概率计算期望计数；样本不足或稀有事件标记为 `inconclusive`。若精确概率无差异，采样波动不会被报告成确定噪声效果。
 
 ## 直接运行
@@ -17,6 +20,7 @@
 ```bash
 python examples/single_qubit_ordering.py
 python examples/bell_short_correlation.py
+python examples/correlated_strength_sweep.py
 ```
 
 命令行示例：
@@ -24,6 +28,7 @@ python examples/bell_short_correlation.py
 ```bash
 python -m quantum_noise.cli --preset single --shots 2000 --seed 20260929 --ordering ad-bf
 python -m quantum_noise.cli --preset bell --shots 2000 --seed 20260929 --ordering late --output batch.json
+python -m quantum_noise.cli --preset corr --noise 0.2 --correlation 0.8 --shots 2000
 python -m quantum_noise.cli --verify batch.json
 ```
 

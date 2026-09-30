@@ -12,6 +12,17 @@ def format_run_report(run: BatchRun) -> str:
         f"base_seed={run.base_seed} sampling_seed={run.seed}",
         "outcome | ideal exact | noisy exact | ideal count | noisy count | 95% test",
     ]
+    if run.noise_seed is not None or run.measure_seed is not None:
+        lines.insert(
+            2,
+            f"noise_seed={run.noise_seed} measure_seed={run.measure_seed}",
+        )
+    if run.noise_trajectories:
+        summary = ", ".join(
+            f"{entry['label']}:{entry['probability']:.4f}"
+            for entry in run.noise_trajectories
+        )
+        lines.insert(3 if len(lines) > 3 else len(lines), f"noise trajectories: {summary}")
     for outcome in outcomes:
         test = run.difference_tests.get(outcome)
         verdict = test.interpretation if test else "not tested"

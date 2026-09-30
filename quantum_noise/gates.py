@@ -5,7 +5,7 @@ from __future__ import annotations
 from cmath import exp as cmath_exp
 from dataclasses import dataclass, field
 from math import cos, sin
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 from .linalg import Matrix
 
@@ -64,6 +64,8 @@ class Operation:
     name: str
     matrix: Matrix
     qubits: Tuple[int, ...]
+    cbit: Optional[int] = None
+    condition: Optional[Tuple[int, int]] = None
 
 
 @dataclass
@@ -71,16 +73,36 @@ class Circuit:
     num_qubits: int
     operations: list[Operation] = field(default_factory=list)
 
-    def apply(self, name: str, matrix: Matrix, qubits: int | Sequence[int]) -> "Circuit":
+    def apply(
+        self,
+        name: str,
+        matrix: Matrix,
+        qubits: int | Sequence[int],
+        condition: Optional[Tuple[int, int]] = None,
+    ) -> "Circuit":
         if isinstance(qubits, int):
             target = (qubits,)
         else:
             target = tuple(qubits)
         self._validate_qubits(target)
+        if condition is not None:
+            cbit, value = condition
+            if cbit < 0 or value not in (0, 1):
+                raise ValueError("condition must be (nonnegative cbit, 0 or 1)")
         expected = 2 ** len(target)
         if len(matrix) != expected or any(len(row) != expected for row in matrix):
             raise ValueError(f"matrix for {name!r} must be {expected}x{expected}")
-        self.operations.append(Operation(name, matrix, target))
+        self.operations.append(Operation(name, matrix, target, condition=condition))
+        return self
+
+    def measure(self, qubit: int, cbit: int) -> "Circuit":
+        """Mid-circuit computational-basis measurement into a classical bit."""
+        self._validate_qubits((qubit,))
+        if cbit < 0:
+            raise ValueError("classical bit index must be nonnegative")
+        self.operations.append(
+            Operation("measure", [[1.0 + 0j]], (qubit,), cbit=cbit)
+        )
         return self
 
     def h(self, qubit: int) -> "Circuit":

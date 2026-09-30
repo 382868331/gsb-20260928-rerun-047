@@ -1,4 +1,11 @@
-"""Explicitly parameterized, physically valid noise channels."""
+"""Explicitly parameterized, physically valid noise channels.
+
+Besides independent channels, this module supports *time-correlated* noise:
+a :class:`CorrelatedNoiseGroup` couples error events at several circuit
+positions through a two-state Markov chain, so the disturbances seen by two
+operations can be correlated.  Correlation strength c = 0 recovers
+independent errors; c -> 1 makes errors at adjacent sites coincide.
+"""
 
 from __future__ import annotations
 
@@ -92,10 +99,104 @@ class NoiseRule:
         raise ValueError(f"unknown noise channel: {self.channel!r}")
 
 
+_CORRELATED_ERROR_OPERATORS = {
+    "bit_flip": X,
+    "phase_flip": Z,
+}
+
+
+@dataclass(frozen=True)
+class CorrelatedNoiseGroup:
+    """A time-correlated error process across several circuit positions.
+
+    ``sites`` are ``(after_gate, qubit)`` pairs in temporal order.  Error
+    occurrences follow a two-state Markov chain with marginal probability
+    ``probability`` and adjacent-site Pearson correlation ``correlation``:
+
+    * P(error at t+1 | error at t)    = p + c * (1 - p)
+    * P(error at t+1 | no error at t) = p * (1 - c)
+
+    Correlations between sites separated by k steps decay as c**k.  The joint
+    trajectory distribution is enumerated exactly by the simulator; it is
+    never replaced by independent per-site sampling.
+    """
+
+    channel: str
+    sites: tuple[tuple[int, int], ...] = ()
+    probability: float = 0.0
+    correlation: float = 0.0
+    name: str = "correlated"
+
+    def __post_init__(self) -> None:
+        if self.channel not in _CORRELATED_ERROR_OPERATORS:
+            raise ValueError(
+                "correlated groups support "
+                f"{sorted(_CORRELATED_ERROR_OPERATORS)}, not {self.channel!r}"
+            )
+        _probability(self.probability, "correlated noise probability")
+        if len(self.sites) < 2:
+            raise ValueError("a correlated group needs at least two sites")
+        if len(set(self.sites)) != len(self.sites):
+            raise ValueError("correlated group sites must be distinct")
+        p = self.probability
+        if p in (0.0, 1.0):
+            lower = -1.0
+        else:
+            lower = max(-p / (1.0 - p), -(1.0 - p) / p)
+        if not lower - 1e-12 <= self.correlation <= 1.0 + 1e-12:
+            raise ValueError(
+                f"correlation must be in [{lower:.6g}, 1] for p={p:g}"
+            )
+
+    @property
+    def error_operator(self) -> Matrix:
+        return _CORRELATED_ERROR_OPERATORS[self.channel]
+
+    def trajectories(self) -> list[tuple[tuple[int, ...], float]]:
+        """Enumerate (error pattern, joint probability) pairs exactly."""
+        p = self.probability
+        c = self.correlation
+        stay_error = p + c * (1.0 - p)
+        become_error = p * (1.0 - c)
+        results: list[tuple[tuple[int, ...], float]] = [((), 1.0)]
+        for site_index in range(len(self.sites)):
+            next_results: list[tuple[tuple[int, ...], float]] = []
+            for pattern, weight in results:
+                if site_index == 0:
+                    p_error = p
+                else:
+                    p_error = stay_error if pattern[-1] == 1 else become_error
+                p_error = min(1.0, max(0.0, p_error))
+                next_results.append((pattern + (1,), weight * p_error))
+                next_results.append((pattern + (0,), weight * (1.0 - p_error)))
+            results = next_results
+        return [(pattern, weight) for pattern, weight in results if weight > 0.0]
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "channel": self.channel,
+            "sites": [list(site) for site in self.sites],
+            "probability": self.probability,
+            "correlation": self.correlation,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "CorrelatedNoiseGroup":
+        return CorrelatedNoiseGroup(
+            channel=data["channel"],
+            sites=tuple(tuple(site) for site in data["sites"]),
+            probability=float(data["probability"]),
+            correlation=float(data.get("correlation", 0.0)),
+            name=data.get("name", "correlated"),
+        )
+
+
 @dataclass(frozen=True)
 class NoiseModel:
     name: str
     rules: Sequence[NoiseRule] = field(default_factory=tuple)
+    groups: Sequence[CorrelatedNoiseGroup] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -110,6 +211,7 @@ class NoiseModel:
                 }
                 for rule in self.rules
             ],
+            "groups": [group.to_dict() for group in self.groups],
         }
 
     @staticmethod
@@ -124,6 +226,10 @@ class NoiseModel:
                     after_gate=item.get("after_gate"),
                     params=dict(item.get("params", {})),
                 )
-                for item in data.get("rules", [])
+                    for item in data.get("rules", [])
+            ),
+            groups=tuple(
+                CorrelatedNoiseGroup.from_dict(item)
+                for item in data.get("groups", [])
             ),
         )
