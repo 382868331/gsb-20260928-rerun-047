@@ -69,7 +69,7 @@ class Operation:
 @dataclass
 class Circuit:
     num_qubits: int
-    operations: list[Operation] = field(default_factory=list)
+    operations: list = field(default_factory=list)
 
     def apply(self, name: str, matrix: Matrix, qubits: int | Sequence[int]) -> "Circuit":
         if isinstance(qubits, int):
@@ -116,11 +116,61 @@ class Circuit:
     def swap(self, left: int, right: int) -> "Circuit":
         return self.apply("swap", SWAP, (left, right))
 
+    def measure(self, qubit: int, bit: int) -> "Circuit":
+        """Measure ``qubit`` mid-circuit and record the bit as classical ``bit``."""
+
+        self._validate_qubits((qubit,))
+        if not isinstance(bit, int) or bit < 0:
+            raise ValueError("classical bit index must be a nonnegative integer")
+        self.operations.append(Measurement(qubit, bit))
+        return self
+
+    def conditional(self, bit: int, name: str, matrix: Matrix, qubit: int) -> "Circuit":
+        """Apply a single-qubit gate conditioned on a previously measured bit."""
+
+        self._validate_qubits((qubit,))
+        expected = 2
+        if len(matrix) != expected or any(len(row) != expected for row in matrix):
+            raise ValueError(f"conditional matrix for {name!r} must be {expected}x{expected}")
+        if not isinstance(bit, int) or bit < 0:
+            raise ValueError("classical bit index must be a nonnegative integer")
+        self.operations.append(ConditionalOperation(bit, Operation(name, matrix, (qubit,))))
+        return self
+
+    def cx_conditional(self, bit: int, qubit: int) -> "Circuit":
+        return self.conditional(bit, "x", X, qubit)
+
+    def cz_conditional(self, bit: int, qubit: int) -> "Circuit":
+        return self.conditional(bit, "z", Z, qubit)
+
+    def ch_conditional(self, bit: int, qubit: int) -> "Circuit":
+        return self.conditional(bit, "h", H, qubit)
+
     def _validate_qubits(self, qubits: Tuple[int, ...]) -> None:
         if len(set(qubits)) != len(qubits):
             raise ValueError("repeated qubit in one operation")
         if any(not 0 <= qubit < self.num_qubits for qubit in qubits):
             raise ValueError("qubit index outside circuit")
+
+
+@dataclass(frozen=True)
+class Measurement:
+    qubit: int
+    bit: int
+
+    @property
+    def name(self) -> str:
+        return f"measure(q{self.qubit}->c{self.bit})"
+
+
+@dataclass(frozen=True)
+class ConditionalOperation:
+    bit: int
+    operation: Operation
+
+    @property
+    def name(self) -> str:
+        return f"if(c{self.bit}).{self.operation.name}"
 
 
 def bell_circuit() -> Circuit:

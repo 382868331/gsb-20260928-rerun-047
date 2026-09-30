@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
-from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
 from .noise import NoiseModel
+from .serialization import circuit_from_dict, circuit_to_dict
 from .simulator import compare_ideal_and_noisy, sample_counts
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
 
@@ -122,7 +122,8 @@ def save_batch_archive(
     runs: list[BatchRun],
 ) -> None:
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "archive_kind": "independent",
         "batch": {
             "name": batch.name,
             "shots": batch.shots,
@@ -137,8 +138,8 @@ def save_batch_archive(
 
 def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") != 1:
-        raise ValueError("unsupported batch archive schema")
+    if payload.get("archive_kind") not in (None, "independent") or payload.get("schema_version") not in (1, 2):
+        raise ValueError("file is not an independent-noise batch archive")
     data = payload["batch"]
     batch = ExperimentBatch(
         circuit=circuit_from_dict(data["circuit"]),
@@ -161,60 +162,3 @@ def rerun_archive(path: str | Path) -> list[BatchRun]:
         ):
             raise ValueError("archive could not be reproduced with its stored seed and specification")
     return rerun
-
-
-def circuit_to_dict(circuit: Circuit) -> dict[str, Any]:
-    operations = []
-    for operation in circuit.operations:
-        kind, angle = _operation_kind_and_angle(operation.name)
-        operations.append(
-            {
-                "name": kind,
-                "qubits": list(operation.qubits),
-                "angle": angle,
-            }
-        )
-    return {"num_qubits": circuit.num_qubits, "operations": operations}
-
-
-def circuit_from_dict(data: dict[str, Any]) -> Circuit:
-    circuit = Circuit(int(data["num_qubits"]))
-    for item in data["operations"]:
-        name = item["name"]
-        qubits = tuple(item["qubits"])
-        angle = item.get("angle")
-        matrix = _gate_matrix(name, angle)
-        operation_name = f"{name}({angle:.12g})" if angle is not None else name
-        circuit.apply(operation_name, matrix, qubits)
-    return circuit
-
-
-def _operation_kind_and_angle(name: str) -> tuple[str, Optional[float]]:
-    if name.endswith(")") and "(" in name:
-        kind, value = name.split("(", 1)
-        return kind, float(value[:-1])
-    return name, None
-
-
-def _gate_matrix(name: str, angle: Optional[float]) -> Any:
-    table = {
-        "h": H,
-        "x": X,
-        "y": Y,
-        "z": Z,
-        "s": S,
-        "cnot": CNOT,
-        "cz": CZ,
-        "swap": SWAP,
-    }
-    if name in table:
-        return table[name]
-    if angle is None:
-        raise ValueError(f"unknown gate {name!r}")
-    if name == "rx":
-        return rx(angle)
-    if name == "ry":
-        return ry(angle)
-    if name == "rz":
-        return rz(angle)
-    raise ValueError(f"unknown gate {name!r}")
