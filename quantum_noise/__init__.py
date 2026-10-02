@@ -7,6 +7,7 @@ from .experiments import (
     ExperimentTask,
     ResumableBatch,
     compare_schedules,
+    disturbance_pause_times,
     resume_batch,
     run_batch,
     save_batch_archive,
@@ -14,7 +15,15 @@ from .experiments import (
     start_resumable_batch,
 )
 from .gates import Circuit, bell_circuit, ghz_circuit
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
+from .noise import (
+    AmbientNoise,
+    CorrelatedNoiseGroup,
+    Disturbance,
+    DisturbancePlan,
+    NoiseModel,
+    NoiseRule,
+    TimeSchedule,
+)
 from .simulator import (
     NoiseTrajectory,
     SimulationResult,
@@ -31,6 +40,9 @@ __all__ = [
     "CorrelatedNoiseGroup",
     "DifferenceTest",
     "ExperimentBatch",
+    "AmbientNoise",
+    "Disturbance",
+    "DisturbancePlan",
     "NoiseModel",
     "NoiseRule",
     "NoiseTrajectory",
@@ -40,6 +52,7 @@ __all__ = [
     "ExperimentTask",
     "ResumableBatch",
     "compare_schedules",
+    "disturbance_pause_times",
     "resume_batch",
     "bell_circuit",
     "compare_counts",

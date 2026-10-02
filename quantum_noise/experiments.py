@@ -8,15 +8,15 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
-from .noise import NoiseModel, TimeSchedule
+from .noise import Disturbance, DisturbancePlan, NoiseModel, TimeSchedule
 from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
 
 
-ARCHIVE_SCHEMA_VERSION = 3
+ARCHIVE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,43 @@ class ExperimentBatch:
     base_seed: int
     name: str = "experiment"
     schedule: Optional[TimeSchedule] = None
+    disturbances: Optional[DisturbancePlan] = None
+    prefix: Optional[str] = None
+
+    def fork_disturbance(
+        self,
+        disturbances: DisturbancePlan | Sequence[Disturbance] | Disturbance,
+        name: str,
+        overlap: str = "reject",
+        as_of: Optional[float] = None,
+    ) -> "ExperimentBatch":
+        """Derive a sibling experiment from the same prefix.
+
+        The circuit, ambient environment, schedule, shot count and base seed
+        are shared, so each sibling keeps its own later environment and
+        measurements while the common prefix stays identical.  When ``as_of``
+        is given, windows that have already started by that time must be
+        reproduced exactly: past facts are never rewritten.
+        """
+        plan = _as_plan(disturbances, overlap)
+        if as_of is not None:
+            for window in plan.disturbances:
+                if window.start <= as_of and self.disturbances is not None:
+                    if window not in self.disturbances.disturbances:
+                        raise ValueError(
+                            f"disturbance starting at t={window.start:g} already occurred; "
+                            "past facts cannot be rewritten"
+                        )
+        return ExperimentBatch(
+            circuit=self.circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=name,
+            schedule=self.schedule,
+            disturbances=plan,
+            prefix=self.name if self.prefix is None else self.prefix,
+        )
 
     def seeds(self, repeats: int) -> list[int]:
         if repeats <= 0:
@@ -41,6 +78,51 @@ class ExperimentBatch:
         if self.schedule is None:
             return None
         return self.schedule.normalized(len(self.circuit.operations))
+
+    def revise_future_disturbances(
+        self, now: float, disturbances: DisturbancePlan | Sequence[Disturbance],
+        overlap: str = "reject",
+    ) -> "ExperimentBatch":
+        """Return a revised plan keeping windows that started at/before ``now``.
+
+        Windows that have not started yet may be freely changed; windows that
+        already started are carried over untouched.
+        """
+        frozen = ()
+        if self.disturbances is not None:
+            frozen = tuple(
+                window
+                for window in self.disturbances.disturbances
+                if window.start <= now
+            )
+        plan = _as_plan(disturbances, overlap)
+        future = tuple(
+            window for window in plan.disturbances if window.start > now
+        )
+        return ExperimentBatch(
+            circuit=self.circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=self.name,
+            schedule=self.schedule,
+            disturbances=DisturbancePlan(frozen + future, overlap=plan.overlap,
+                                         restore=plan.restore, name=plan.name),
+            prefix=self.prefix,
+        )
+
+
+def _as_plan(
+    disturbances: DisturbancePlan | Sequence[Disturbance] | Disturbance,
+    overlap: str = "reject",
+) -> DisturbancePlan:
+    if isinstance(disturbances, DisturbancePlan):
+        return disturbances
+    if isinstance(disturbances, Disturbance):
+        items = (disturbances,)
+    else:
+        items = tuple(disturbances)
+    return DisturbancePlan(items, overlap=overlap)
 
 
 @dataclass(frozen=True)
@@ -63,6 +145,7 @@ class BatchRun:
     environment_changes: Optional[list[dict[str, Any]]] = None
     measurement_conditions: Optional[list[dict[str, Any]]] = None
     schedule: Optional[TimeSchedule] = None
+    disturbances: Optional[DisturbancePlan] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +178,9 @@ class BatchRun:
             "environment_changes": self.environment_changes,
             "measurement_conditions": self.measurement_conditions,
             "schedule": self.schedule.to_dict() if self.schedule is not None else None,
+            "disturbances": self.disturbances.to_dict()
+            if self.disturbances is not None
+            else None,
         }
 
 
@@ -107,7 +193,7 @@ def run_batch(
         else None
     )
     ideal_result, noisy_result = compare_ideal_and_noisy(
-        batch.circuit, batch.noise_model, schedule
+        batch.circuit, batch.noise_model, schedule, batch.disturbances
     )
     correlated = bool(batch.noise_model.groups)
     trajectory_records = None
@@ -176,6 +262,7 @@ def run_batch(
                 environment_changes=environment_changes,
                 measurement_conditions=measurement_conditions,
                 schedule=schedule,
+                disturbances=batch.disturbances,
             )
         )
     return runs
@@ -200,6 +287,10 @@ def save_batch_archive(
             "circuit": circuit_to_dict(batch.circuit),
             "noise_model": batch.noise_model.to_dict(),
             "schedule": batch.schedule.to_dict() if batch.schedule is not None else None,
+            "disturbances": batch.disturbances.to_dict()
+            if batch.disturbances is not None
+            else None,
+            "prefix": batch.prefix,
         },
         "runs": [run.to_dict() for run in runs],
     }
@@ -220,6 +311,10 @@ def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]
         schedule=TimeSchedule.from_dict(data["schedule"])
         if data.get("schedule") is not None
         else None,
+        disturbances=DisturbancePlan.from_dict(data["disturbances"])
+        if data.get("disturbances") is not None
+        else None,
+        prefix=data.get("prefix"),
     )
     return batch, payload["runs"]
 
@@ -305,6 +400,10 @@ def _batch_payload(batch: ExperimentBatch) -> dict[str, Any]:
         "schedule": batch.normalized_schedule.to_dict()
         if batch.normalized_schedule is not None
         else None,
+        "disturbances": batch.disturbances.to_dict()
+        if batch.disturbances is not None
+        else None,
+        "prefix": batch.prefix,
     }
 
 
@@ -408,6 +507,10 @@ class ResumableBatch:
             schedule=TimeSchedule.from_dict(batch_data["schedule"])
             if batch_data.get("schedule") is not None
             else None,
+            disturbances=DisturbancePlan.from_dict(batch_data["disturbances"])
+            if batch_data.get("disturbances") is not None
+            else None,
+            prefix=batch_data.get("prefix"),
         )
         execution = cls(
             path=Path(path),
@@ -462,6 +565,7 @@ def start_resumable_batch(
     repeats: int = 1,
     pause_after_measurement: bool = False,
     pause_after_idle: bool = False,
+    pause_at: Optional[float] = None,
 ) -> ResumableBatch:
     pause_point = None
     if pause_after_measurement or pause_after_idle:
@@ -469,7 +573,23 @@ def start_resumable_batch(
             "kind": "measurement" if pause_after_measurement else "idle",
             "resumable": True,
         }
+    if pause_at is not None:
+        pause_point = {"kind": "disturbance_time", "time": float(pause_at), "resumable": True}
     return ResumableBatch.start(path, batch, repeats, pause_point)
+
+
+def disturbance_pause_times(plan: "DisturbancePlan") -> list[float]:
+    """Disturbance starts, overlaps and ends, sorted and deduplicated."""
+    points: list[float] = []
+    windows = sorted(plan.disturbances, key=lambda item: (item.start, item.end))
+    for window in windows:
+        points.extend((float(window.start), float(window.end)))
+    for left, right in zip(windows[:-1], windows[1:]):
+        overlap_start = max(left.start, right.start)
+        overlap_end = min(left.end, right.end)
+        if overlap_start < overlap_end:
+            points.append(float(overlap_start))
+    return sorted(set(points))
 
 
 def resume_batch(path: str | Path) -> ResumableBatch:
@@ -537,6 +657,9 @@ def _batch_run_from_dict(data: dict[str, Any]) -> BatchRun:
         measurement_conditions=data.get("measurement_conditions"),
         schedule=TimeSchedule.from_dict(data["schedule"])
         if data.get("schedule") is not None
+        else None,
+        disturbances=DisturbancePlan.from_dict(data["disturbances"])
+        if data.get("disturbances") is not None
         else None,
     )
 

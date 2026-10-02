@@ -17,6 +17,158 @@ from .gates import I, X, Y, Z
 from .linalg import Matrix
 
 Probability = float
+AMBIENT_CHANNEL_NAMES = ("bit_flip", "phase_flip", "depolarizing", "amplitude_damping")
+
+
+@dataclass(frozen=True)
+class AmbientNoise:
+    """Baseline continuous-time noise with one rate (per unit time) per channel.
+
+    Rates are Lindblad rates integrated over physical time, not per-operation
+    probabilities; they are resolved into exact channels by
+    :mod:`quantum_noise.environment`.
+    """
+
+    qubits: tuple[int, ...] = (0,)
+    bit_flip: float = 0.0
+    phase_flip: float = 0.0
+    depolarizing: float = 0.0
+    amplitude_damping: float = 0.0
+    name: str = "ambient"
+
+    def __post_init__(self) -> None:
+        if not self.qubits:
+            raise ValueError("ambient noise must target at least one qubit")
+        for label in AMBIENT_CHANNEL_NAMES:
+            value = getattr(self, label)
+            if float(value) < 0.0:
+                raise ValueError(f"{label} rate must be nonnegative")
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "qubits": list(self.qubits),
+            "bit_flip": self.bit_flip,
+            "phase_flip": self.phase_flip,
+            "depolarizing": self.depolarizing,
+            "amplitude_damping": self.amplitude_damping,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "AmbientNoise":
+        return AmbientNoise(
+            qubits=tuple(int(v) for v in data.get("qubits", (0,))),
+            bit_flip=float(data.get("bit_flip", 0.0)),
+            phase_flip=float(data.get("phase_flip", 0.0)),
+            depolarizing=float(data.get("depolarizing", 0.0)),
+            amplitude_damping=float(data.get("amplitude_damping", 0.0)),
+            name=data.get("name", "ambient"),
+        )
+
+
+@dataclass(frozen=True)
+class Disturbance:
+    """A finite external disturbance over the half-open interval [start, end).
+
+    Each channel field that is not ``None`` overrides the ambient baseline
+    while the window is active; unset channels keep their ambient values.
+    The baseline is restored after the last active window, so a disturbance
+    never leaks into later operations.
+    """
+
+    start: float
+    end: float
+    bit_flip: Optional[float] = None
+    phase_flip: Optional[float] = None
+    depolarizing: Optional[float] = None
+    amplitude_damping: Optional[float] = None
+    name: str = "disturbance"
+
+    def __post_init__(self) -> None:
+        if float(self.start) < 0.0:
+            raise ValueError("disturbance start must be nonnegative")
+        if float(self.end) < float(self.start):
+            raise ValueError("disturbance end must not precede its start")
+        for label in AMBIENT_CHANNEL_NAMES:
+            value = getattr(self, label)
+            if value is not None and float(value) < 0.0:
+                raise ValueError(f"{label} override must be nonnegative")
+
+    def overrides(self) -> dict[str, float]:
+        return {
+            label: float(getattr(self, label))
+            for label in AMBIENT_CHANNEL_NAMES
+            if getattr(self, label) is not None
+        }
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "start": self.start,
+            "end": self.end,
+            "bit_flip": self.bit_flip,
+            "phase_flip": self.phase_flip,
+            "depolarizing": self.depolarizing,
+            "amplitude_damping": self.amplitude_damping,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Disturbance":
+        return Disturbance(
+            start=float(data["start"]),
+            end=float(data["end"]),
+            bit_flip=data.get("bit_flip"),
+            phase_flip=data.get("phase_flip"),
+            depolarizing=data.get("depolarizing"),
+            amplitude_damping=data.get("amplitude_damping"),
+            name=data.get("name", "disturbance"),
+        )
+
+
+@dataclass(frozen=True)
+class DisturbancePlan:
+    """Several disturbances sharing one experiment prefix.
+
+    Overlapping windows are resolved explicitly:
+
+    * ``"reject"`` (default): overlapping windows are an error;
+    * ``"latest"``: the window starting latest wins every channel it sets;
+    * ``"max"``: every channel takes the largest active override.
+
+    After the union of windows ends, every channel returns to the ambient
+    baseline (``restore="ambient"`` is the only supported policy; a window
+    never mutates the persistent baseline).
+    """
+
+    disturbances: tuple[Disturbance, ...] = ()
+    overlap: str = "reject"
+    restore: str = "ambient"
+    name: str = "disturbance-plan"
+
+    def __post_init__(self) -> None:
+        if self.overlap not in ("reject", "latest", "max"):
+            raise ValueError("overlap must be 'reject', 'latest' or 'max'")
+        if self.restore != "ambient":
+            raise ValueError("only restore='ambient' is supported")
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "overlap": self.overlap,
+            "restore": self.restore,
+            "disturbances": [item.to_dict() for item in self.disturbances],
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "DisturbancePlan":
+        return DisturbancePlan(
+            disturbances=tuple(
+                Disturbance.from_dict(item) for item in data.get("disturbances", ())
+            ),
+            overlap=data.get("overlap", "reject"),
+            restore=data.get("restore", "ambient"),
+            name=data.get("name", "disturbance-plan"),
+        )
 
 
 def _probability(value: float, name: str) -> float:
@@ -275,6 +427,7 @@ class NoiseModel:
     name: str
     rules: Sequence[NoiseRule] = field(default_factory=tuple)
     groups: Sequence[CorrelatedNoiseGroup] = field(default_factory=tuple)
+    ambient: Optional["AmbientNoise"] = None
 
     def to_dict(self) -> dict:
         return {
@@ -290,6 +443,7 @@ class NoiseModel:
                 for rule in self.rules
             ],
             "groups": [group.to_dict() for group in self.groups],
+            "ambient": self.ambient.to_dict() if self.ambient is not None else None,
         }
 
     @staticmethod
@@ -310,4 +464,7 @@ class NoiseModel:
                 CorrelatedNoiseGroup.from_dict(item)
                 for item in data.get("groups", [])
             ),
+            ambient=AmbientNoise.from_dict(data["ambient"])
+            if data.get("ambient") is not None
+            else None,
         )

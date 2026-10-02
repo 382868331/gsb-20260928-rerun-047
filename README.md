@@ -13,6 +13,7 @@
 - 时间安排与持续扰动：`TimeSchedule` 为每个操作和随后的空闲区间指定时间；相关组使用有限 `correlation_time`，相关随两次环境事件的实际间隔指数衰减。
 - 分支独立环境：中途测量后的每个经典分支单独延续环境状态；条件门被跳过时，不会只因为分支操作数量相同就共享扰动历史。
 - 可恢复批次：时间表对照分别保存环境变化、测量条件和统计结果；单批次与多批次检查点可在中途测量或空闲暂停后恢复，改变套件执行顺序不改变各批次结果。
+- 外部瞬时扰动：`AmbientNoise` 给出按物理时间积分的基准环境（位翻转、相位翻转、去极化、振幅阻尼，统一由 Lindblad 超算符精确半群给出），`Disturbance` 在半开区间 `[start, end)` 内短暂覆盖环境强度、结束后恢复基准。扰动落在门中途或空闲区间都按实际时间生效，绝不归到下一次操作开始；零长度瞬时边界不产生作用。同一方案可用 `DisturbancePlan(overlap=...)` 放多个重叠扰动（`reject`/`latest`/`max`），记录重叠时采用的条件与恢复状态；`ExperimentBatch.fork_disturbance` 从同一实验前缀派生不同扰动时刻并保留各自后续环境与测量，已发生扰动不能回写，未来扰动可用 `revise_future_disturbances` 修改。检查点可在扰动开始、重叠或结束附近暂停（`pause_at=`、`disturbance_pause_times`），恢复时重放原批次。
 - 状态校验：每次模拟检查迹、Hermitian 性、正半定性和测量概率归一。
 - 并排检查：同一线路同时输出理想与有噪精确概率、采样计数和差异解释。
  - 批次复现：保存线路（含测量与条件）、噪声设定（含相关组）、基础种子、派生采样种子、重复次数与样本计数；归档可重新执行并核对。归档为 schema 2，旧的 schema 1 独立噪声实验仍可读取并重放。
@@ -25,6 +26,7 @@ python examples/single_qubit_ordering.py
 python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
+python examples/disturbance_comparison.py
 ```
 
 命令行示例：
@@ -56,6 +58,32 @@ batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 2026100
 ```
 
 `compare_schedules` 用同一操作序列生成多个独立命名批次；`save_schedule_comparison` 为每个时间安排分别写入环境变化、测量条件与统计结果。`start_resumable_batch`/`resume_batch` 和 `BatchCheckpoint.resume(..., order=[...])` 用于暂停恢复和检查执行顺序无关性。
+
+### 外部瞬时扰动对照
+
+```python
+ambient = AmbientNoise(qubits=(0,), bit_flip=0.05)
+model = NoiseModel("background", (), (), ambient)
+prefix = ExperimentBatch(
+    circuit, model, shots=4000, base_seed=20261002,
+    name="disturbance-prefix",
+    schedule=TimeSchedule((1.0, 1.0), (0.0, 2.0)),
+)
+mid_gate = prefix.fork_disturbance(
+    DisturbancePlan((Disturbance(0.25, 0.9, bit_flip=1.5),)),
+    name="pulse-mid-gate",
+)
+overlapping = prefix.fork_disturbance(
+    DisturbancePlan(
+        (Disturbance(0.0, 1.0, bit_flip=0.4),
+         Disturbance(0.5, 1.5, bit_flip=1.2)),
+        overlap="latest",
+    ),
+    name="overlapping-pulses",
+)
+```
+
+窗口是半开区间 `[start, end)`：开始边界计入扰动，结束边界已经恢复；`start == end` 的瞬时窗口不改变任何结果。每个恒速率时间段的通道都由 Lindblad 生成器取指数得到，所以把同一时间安排重新分段（改变操作分段或把时间从门时长移到空闲）不会改变物理含义。
 
 ## 最小代码示例
 

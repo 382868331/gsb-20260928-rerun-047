@@ -10,7 +10,14 @@ from typing import Optional, Sequence
 
 from .gates import Circuit
 from .linalg import Matrix, dagger, embedding, matmul, trace, zeros
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
+from .environment import (
+    _merge_times,
+    fractional_unitary,
+    operation_intervals,
+    resolve_segments,
+    segment_kraus,
+)
+from .noise import AmbientNoise, CorrelatedNoiseGroup, DisturbancePlan, NoiseModel, NoiseRule, TimeSchedule
 
 
 @dataclass(frozen=True)
@@ -56,6 +63,7 @@ def simulate(
     circuit: Circuit,
     noise_model: Optional[NoiseModel] = None,
     schedule: Optional[TimeSchedule] = None,
+    disturbance_plan: Optional[DisturbancePlan] = None,
 ) -> SimulationResult:
     rules = list(noise_model.rules if noise_model is not None else [])
     groups = list(noise_model.groups if noise_model is not None else [])
@@ -64,25 +72,77 @@ def simulate(
     _validate_rules(circuit, rules)
     _validate_groups(circuit, groups)
 
-    if not groups:
+    ambient = noise_model.ambient if noise_model is not None else None
+    if ambient is not None:
+        for qubit in ambient.qubits:
+            if not 0 <= qubit < circuit.num_qubits:
+                raise ValueError("ambient noise targets a qubit outside circuit")
+        if schedule is None:
+            raise ValueError("ambient noise requires a TimeSchedule")
+
+    timed = ambient is not None and schedule is not None
+    if not timed:
         state, classical = _evolve(circuit, rules, {}, schedule=schedule)
+        if not groups:
+            environment_records = None
+            measurement_conditions = None
+            if schedule is not None or any(op.name == "measure" for op in circuit.operations):
+                registers = _possible_registers(circuit)
+                measurement_conditions = tuple(
+                    _measurement_conditions(circuit, register) for register in registers
+                ) or None
+                environment_records = tuple(
+                    {
+                        "branch": "".join(str(bit) for bit in register),
+                        "probability": 1.0 if not register else None,
+                        "measurement_conditions": _measurement_conditions(circuit, register),
+                        "schedule": schedule.to_dict() if schedule is not None else None,
+                        "events": _rule_environment_events(circuit, rules, schedule),
+                    }
+                    for register in _possible_registers(circuit)
+                )
+            result = SimulationResult(
+                state=state,
+                probabilities=measurement_probabilities(state, circuit.num_qubits),
+                classical_probabilities=classical,
+                environment_records=environment_records,
+                measurement_conditions=measurement_conditions,
+                schedule=schedule,
+            )
+            validate_density_matrix(result.state)
+            return result
+        timed_segments = None
+    else:
+        timed_segments = resolve_segments(
+            schedule.operation_durations,
+            schedule.idle_after,
+            ambient,
+            disturbance_plan,
+        )
+
+    if not groups:
+        state, classical, branch_segments = _evolve_timed(
+            circuit, rules, ambient, timed_segments, schedule, {}
+        )
         environment_records = None
         measurement_conditions = None
-        if schedule is not None or any(op.name == "measure" for op in circuit.operations):
-            registers = _possible_registers(circuit)
-            measurement_conditions = tuple(
-                _measurement_conditions(circuit, register) for register in registers
-            ) or None
-            environment_records = tuple(
-                {
-                    "branch": "".join(str(bit) for bit in register),
-                    "probability": 1.0 if not register else None,
-                    "measurement_conditions": _measurement_conditions(circuit, register),
-                    "schedule": schedule.to_dict() if schedule is not None else None,
-                    "events": _rule_environment_events(circuit, rules, schedule),
-                }
-                for register in _possible_registers(circuit)
-            )
+        registers = _possible_registers(circuit)
+        measurement_conditions = tuple(
+            _measurement_conditions(circuit, register) for register in registers
+        ) or None
+        environment_records = tuple(
+            {
+                "branch": "".join(str(bit) for bit in register),
+                "probability": 1.0 if not register else None,
+                "measurement_conditions": _measurement_conditions(circuit, register),
+                "schedule": schedule.to_dict() if schedule is not None else None,
+                "segments": branch_segments.get(
+                    "".join(str(bit) for bit in register), _shared_records(timed_segments)
+                ),
+                "events": _rule_environment_events(circuit, rules, schedule),
+            }
+            for register in registers
+        )
         result = SimulationResult(
             state=state,
             probabilities=measurement_probabilities(state, circuit.num_qubits),
@@ -113,13 +173,25 @@ def simulate(
     trajectories: list[NoiseTrajectory] = []
     environment_records: list[dict[str, object]] = []
     for branch, pattern, weight, events, environment_states, record in combined:
-        branch_state, classical = _evolve(
-            circuit,
-            rules,
-            {branch: events},
-            schedule=schedule,
-            only_branch=branch,
-        )
+        if timed:
+            branch_state, classical, branch_segments = _evolve_timed(
+                circuit,
+                rules,
+                ambient,
+                timed_segments,
+                schedule,
+                {branch: events},
+                only_branch=branch,
+            )
+            record["segments"] = branch_segments.get(branch)
+        else:
+            branch_state, classical = _evolve(
+                circuit,
+                rules,
+                {branch: events},
+                schedule=schedule,
+                only_branch=branch,
+            )
         for row in range(size):
             for col in range(size):
                 state[row][col] += weight * branch_state[row][col]
@@ -471,6 +543,261 @@ def _evolve(
     return final, classical
 
 
+def _shared_records(segments: Optional[list[dict[str, object]]]) -> list[dict[str, object]]:
+    if segments is None:
+        return []
+    return [
+        {
+            "time_start": segment["time_start"],
+            "time_end": segment["time_end"],
+            "duration": segment["duration"],
+            "rates": dict(segment["rates"]),
+            "disturbances": list(segment["disturbances"]),
+            "restored": segment["restored"],
+        }
+        for segment in segments
+    ]
+
+
+def _apply_ambient(
+    state: Matrix,
+    ambient: AmbientNoise,
+    rates: dict[str, float],
+    duration: float,
+    num_qubits: int,
+) -> Matrix:
+    kraus_operators = segment_kraus(rates, duration)
+    for qubit in ambient.qubits:
+        output: Matrix = [[0.0j for _ in range(2**num_qubits)] for _ in range(2**num_qubits)]
+        for kraus in kraus_operators:
+            operator = embedding(kraus, (qubit,), num_qubits)
+            component = matmul(matmul(operator, state), dagger(operator))
+            for row in range(len(output)):
+                for col in range(len(output)):
+                    output[row][col] += component[row][col]
+        state = output
+    return state
+
+
+def _evolve_timed(
+    circuit: Circuit,
+    rules: Sequence[NoiseRule],
+    ambient: AmbientNoise,
+    segments: list[dict[str, object]],
+    schedule: TimeSchedule,
+    error_events: dict[str, dict[int, list[tuple[Matrix, tuple[int, ...]]]]],
+    only_branch: str = "",
+) -> tuple[Matrix, dict[str, float], dict[str, list[dict[str, object]]]]:
+    """Evolve branches along the real physical timeline.
+
+    The timeline is the union of operation boundaries and disturbance
+    boundaries.  Each constant-rate piece applies its exact Lindblad channel
+    to every live branch; a gate crossing a boundary is split into fractions
+    of the same unitary.  Correlated error operators attach to the instant
+    their site occupies, and discrete rules to the end of their operation.
+    """
+    num_qubits = circuit.num_qubits
+    operations = circuit.operations
+    intervals = operation_intervals(
+        schedule.operation_durations, schedule.idle_after
+    )
+    boundaries = {0.0}
+    for start, end, _index in intervals:
+        boundaries.add(float(start))
+        boundaries.add(float(end))
+    for segment in segments:
+        boundaries.add(float(segment["time_start"]))
+        boundaries.add(float(segment["time_end"]))
+    timeline = _merge_times(sorted(boundaries))
+
+    branches: list[tuple[Matrix, tuple[int, ...]]] = [(zero_state(num_qubits), ())]
+    experienced: dict[str, list[dict[str, object]]] = {}
+    applied_rules: dict[str, set[int]] = {}
+    applied_group_events: dict[str, set[int]] = {}
+
+    # Instant operations at t=0 (zero-duration gates and measurements) run
+    # before the first open interval.
+    zero_branches: list[tuple[Matrix, tuple[int, ...]]] = []
+    for state, register in branches:
+        operation = operations[0]
+        op_start, op_end, _ = intervals[0]
+        if abs(op_start) < 1e-12 and op_end - op_start <= 1e-12:
+            if operation.name == "measure":
+                zero_branches.extend(
+                    _measure(
+                        state, operation.qubits[0], operation.cbit,
+                        register, num_qubits,
+                    )
+                )
+                continue
+            if operation.condition is None or _register_matches(
+                register, operation.condition
+            ):
+                unitary = embedding(operation.matrix, operation.qubits, num_qubits)
+                state = _apply_unitary(state, unitary)
+        zero_branches.append((state, register))
+    branches = zero_branches
+
+    def branch_key(register: tuple[int, ...]) -> str:
+        return "".join(str(bit) for bit in register)
+
+    def events_for(register: tuple[int, ...]) -> dict[int, list[tuple[Matrix, tuple[int, ...]]]]:
+        if error_events and all(isinstance(key, int) for key in error_events):
+            return error_events  # type: ignore[return-value]
+        return error_events.get(branch_key(register), {})  # type: ignore[union-attr]
+
+    def rates_at(time: float) -> dict[str, float]:
+        for segment in segments:
+            if segment["time_start"] <= time < segment["time_end"]:
+                return dict(segment["rates"])  # type: ignore[return-value]
+        return dict(segments[-1]["rates"])  # type: ignore[index]
+
+    gate_pieces: dict[int, list[tuple[float, float, float]]] = {}
+    for index, (start, end, _op_index) in enumerate(intervals):
+        cuts = [start] + [time for time in timeline if start < time < end] + [end]
+        total = end - start
+        gate_pieces[index] = [
+            (left, right, (right - left) / total if total > 0 else 1.0)
+            for left, right in zip(cuts[:-1], cuts[1:])
+        ]
+
+    def active_operation(time: float) -> Optional[int]:
+        for index, (start, end, _op) in enumerate(intervals):
+            if start <= time < end - 1e-12:
+                return index
+        return None
+
+    def operation_starting_at(time: float) -> Optional[int]:
+        for index, (start, _end, _op) in enumerate(intervals):
+            if abs(start - time) < 1e-12:
+                return index
+        return None
+
+    for cursor, next_time in zip(timeline[:-1], timeline[1:]):
+        duration = next_time - cursor
+        operation_index = active_operation(cursor)
+        # 1) Continuous evolution over [cursor, next_time): gate fractions
+        # and ambient Lindblad channels.
+        evolved: list[tuple[Matrix, tuple[int, ...]]] = []
+        for state, register in branches:
+            if operation_index is not None:
+                operation = operations[operation_index]
+                if operation.name != "measure" and (
+                    operation.condition is None
+                    or _register_matches(register, operation.condition)
+                ):
+                    fraction = 1.0
+                    for left, right, value in gate_pieces[operation_index]:
+                        if abs(left - cursor) < 1e-12 and abs(right - next_time) < 1e-12:
+                            fraction = value
+                            break
+                    if fraction > 0.0:
+                        partial = fractional_unitary(operation.matrix, fraction)
+                        unitary = embedding(partial, operation.qubits, num_qubits)
+                        state = _apply_unitary(state, unitary)
+            state = _apply_ambient(state, ambient, rates_at(cursor), duration, num_qubits)
+            evolved.append((state, register))
+        branches = evolved
+
+        # 2) Instant events at t = next_time: operations that start there
+        # (including zero-duration gates and measurements) and end-of-gate
+        # noise of operations that finish there.
+        ending = [
+            index
+            for index, (_start, end, _op) in enumerate(intervals)
+            if abs(end - next_time) < 1e-12
+        ]
+        starting = operation_starting_at(next_time)
+        instant_branches: list[tuple[Matrix, tuple[int, ...]]] = []
+        for state, register in branches:
+            key = branch_key(register)
+            for index in ending:
+                done_rules = applied_rules.setdefault(key, set())
+                if index not in done_rules:
+                    for rule in rules:
+                        if rule.after_gate == index:
+                            state = _apply_rule(state, rule, num_qubits)
+                    done_rules.add(index)
+                done_group = applied_group_events.setdefault(key, set())
+                if index not in done_group:
+                    for operator, qubits in events_for(register).get(index, ()):
+                        unitary = embedding(operator, qubits, num_qubits)
+                        state = _apply_unitary(state, unitary)
+                    done_group.add(index)
+            if starting is not None:
+                operation = operations[starting]
+                if operation.name == "measure":
+                    instant_branches.extend(
+                        _measure(
+                            state, operation.qubits[0], operation.cbit,
+                            register, num_qubits,
+                        )
+                    )
+                    continue
+                if operation.condition is None or _register_matches(
+                    register, operation.condition
+                ):
+                    _start, _end, _op = intervals[starting]
+                    if _end - _start <= 1e-12:
+                        unitary = embedding(operation.matrix, operation.qubits, num_qubits)
+                        state = _apply_unitary(state, unitary)
+            instant_branches.append((state, register))
+        branches = instant_branches
+
+        for _state, register in branches:
+            key = branch_key(register)
+            history = experienced.setdefault(key, [])
+            for segment in segments:
+                overlap_start = max(cursor, float(segment["time_start"]))
+                overlap_end = min(next_time, float(segment["time_end"]))
+                if overlap_end - overlap_start <= 1e-12:
+                    continue
+                history.append(
+                    {
+                        "time_start": overlap_start,
+                        "time_end": overlap_end,
+                        "duration": overlap_end - overlap_start,
+                        "rates": dict(segment["rates"]),
+                        "disturbances": list(segment["disturbances"]),
+                        "restored": segment["restored"],
+                    }
+                )
+
+    # End-of-timeline instant: rules after the complete circuit and site
+    # events whose operation ends exactly at the horizon.
+    finished: list[tuple[Matrix, tuple[int, ...]]] = []
+    final_time = timeline[-1]
+    for state, register in branches:
+        key = branch_key(register)
+        for rule in rules:
+            if rule.after_gate is None:
+                state = _apply_rule(state, rule, num_qubits)
+        for index, (_start, end, _op) in enumerate(intervals):
+            if abs(end - final_time) >= 1e-12:
+                continue
+            done_group = applied_group_events.setdefault(key, set())
+            if index not in done_group:
+                for operator, qubits in events_for(register).get(index, ()):
+                    unitary = embedding(operator, qubits, num_qubits)
+                    state = _apply_unitary(state, unitary)
+                done_group.add(index)
+        finished.append((state, register))
+
+    size = 2**num_qubits
+    final = zeros(size, size)
+    classical: dict[str, float] = {}
+    for state, register in finished:
+        key = branch_key(register)
+        if only_branch and key != only_branch:
+            continue
+        for row in range(size):
+            for col in range(size):
+                final[row][col] += state[row][col]
+        if register:
+            classical[key] = classical.get(key, 0.0) + trace(state).real
+    return final, classical, experienced
+
+
 def _measure(
     state: Matrix, qubit: int, cbit: Optional[int], register: tuple[int, ...],
     num_qubits: int,
@@ -494,10 +821,13 @@ def _measure(
 
 
 def compare_ideal_and_noisy(
-    circuit: Circuit, noise_model: NoiseModel, schedule: Optional[TimeSchedule] = None
+    circuit: Circuit,
+    noise_model: NoiseModel,
+    schedule: Optional[TimeSchedule] = None,
+    disturbance_plan: Optional[DisturbancePlan] = None,
 ) -> tuple[SimulationResult, SimulationResult]:
     return simulate(circuit, schedule=schedule), simulate(
-        circuit, noise_model, schedule=schedule
+        circuit, noise_model, schedule=schedule, disturbance_plan=disturbance_plan
     )
 
 
