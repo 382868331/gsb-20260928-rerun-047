@@ -99,6 +99,193 @@ class NoiseRule:
         raise ValueError(f"unknown noise channel: {self.channel!r}")
 
 
+@dataclass(frozen=True)
+class Perturbation:
+    """A transient external disturbance active over ``[start, end)``.
+
+    While active the disturbance replaces the environmental noise strength
+    of its target channels with ``probability`` (and optionally scales the
+    correlation time).  Events at exactly ``end`` see the restored baseline
+    environment; the interval is half-open, so an instantaneous disturbance
+    (``start == end``) never changes any event.  ``priority`` resolves
+    overlapping disturbances: a higher-priority disturbance wins; equal
+    priorities follow the later entry in the perturbation list.
+    """
+
+    start: float
+    end: float
+    probability: Optional[float] = None
+    correlation_time_scale: float = 1.0
+    name: str = "perturbation"
+    targets: Optional[frozenset[str]] = None
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if float(self.start) < 0.0:
+            raise ValueError("perturbation start must be nonnegative")
+        if float(self.end) < float(self.start):
+            raise ValueError("perturbation end must not precede its start")
+        if self.probability is not None:
+            _probability(float(self.probability), "perturbation probability")
+        if float(self.correlation_time_scale) < 0.0:
+            raise ValueError("correlation_time_scale must be nonnegative")
+
+    @property
+    def instantaneous(self) -> bool:
+        return float(self.end) == float(self.start)
+
+    def active_at(self, time: float) -> bool:
+        return float(self.start) <= float(time) < float(self.end)
+
+    def overlaps(self, other: "Perturbation") -> bool:
+        if self.instantaneous or other.instantaneous:
+            return False
+        return float(self.start) < float(other.end) and float(other.start) < float(self.end)
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "start": float(self.start),
+            "end": float(self.end),
+            "probability": None if self.probability is None else float(self.probability),
+            "correlation_time_scale": float(self.correlation_time_scale),
+            "targets": None if self.targets is None else sorted(self.targets),
+            "priority": int(self.priority),
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "Perturbation":
+        targets = data.get("targets")
+        return Perturbation(
+            start=float(data["start"]),
+            end=float(data["end"]),
+            probability=None if data.get("probability") is None else float(data["probability"]),
+            correlation_time_scale=float(data.get("correlation_time_scale", 1.0)),
+            name=data.get("name", "perturbation"),
+            targets=None if targets is None else frozenset(targets),
+            priority=int(data.get("priority", 0)),
+        )
+
+
+@dataclass(frozen=True)
+class EnvironmentTimeline:
+    """Resolved environmental state along physical time."""
+
+    perturbations: tuple[Perturbation, ...] = ()
+
+    def __post_init__(self) -> None:
+        if any(not isinstance(item, Perturbation) for item in self.perturbations):
+            raise ValueError("timeline entries must be Perturbation instances")
+
+    def active(self, time: float) -> tuple[Perturbation, ...]:
+        active = [item for item in self.perturbations if item.active_at(time)]
+        active.sort(key=lambda item: (item.priority, self.perturbations.index(item)))
+        return tuple(reversed(active))
+
+    def effective_at(
+        self, time: float, channel: str
+    ) -> tuple[Optional[Perturbation], Optional[float]]:
+        """Return the winning disturbance and effective probability at ``time``."""
+        for perturbation in self.active(time):
+            if perturbation.targets is None or channel in perturbation.targets:
+                return perturbation, perturbation.probability
+        return None, None
+
+    def winner_at(self, time: float) -> Optional[Perturbation]:
+        active = self.active(time)
+        return active[0] if active else None
+
+    def correlation_over(
+        self,
+        correlation: float,
+        start_time: float,
+        end_time: float,
+        base_time: float,
+        channel: str,
+    ) -> float:
+        """Correlation surviving a possibly piecewise-perturbed interval."""
+        elapsed = end_time - start_time
+        if elapsed < 0.0:
+            raise ValueError("elapsed time must be nonnegative")
+        if elapsed == 0.0 or base_time == inf:
+            return correlation
+        boundaries = {start_time, end_time}
+        for perturbation in self.perturbations:
+            if perturbation.targets is not None and channel not in perturbation.targets:
+                continue
+            if start_time < perturbation.start < end_time:
+                boundaries.add(float(perturbation.start))
+            if start_time < perturbation.end <= end_time:
+                boundaries.add(float(perturbation.end))
+        decay = 0.0
+        ordered = sorted(boundaries)
+        for left, right in zip(ordered, ordered[1:]):
+            duration = right - left
+            if duration <= 0.0:
+                continue
+            winner, _probability = self.effective_at((left + right) / 2.0, channel)
+            scale = 1.0 if winner is None else winner.correlation_time_scale
+            if scale == 0.0:
+                return 0.0
+            decay += duration / (base_time * scale)
+        return correlation * exp(-decay)
+
+    def change_records(self) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = []
+        for index, perturbation in enumerate(self.perturbations):
+            overlaps = [
+                other.name
+                for other_index, other in enumerate(self.perturbations)
+                if other_index != index and perturbation.overlaps(other)
+            ]
+            for kind, time in (("start", perturbation.start), ("end", perturbation.end)):
+                # End events sit on the half-open boundary, so active_at(end)
+                # describes the restored environment.
+                winning = self.winner_at(time)
+                probability = winning.probability if winning is not None else None
+                records.append(
+                    {
+                        "perturbation": perturbation.name,
+                        "kind": kind,
+                        "time": float(time),
+                        "time_inclusive": kind == "start",
+                        "probability": probability,
+                        "correlation_time_scale": perturbation.correlation_time_scale,
+                        "overlapping": overlaps,
+                        "environment_owner": winning.name if winning is not None else None,
+                        "restored": kind == "end",
+                        "restored_environment": winning.name if winning is not None else "baseline",
+                    }
+                )
+        records.sort(key=lambda record: (record["time"], 0 if record["kind"] == "start" else 1))
+        return records
+
+    def to_list(self) -> list[dict]:
+        return [item.to_dict() for item in self.perturbations]
+
+    @staticmethod
+    def from_list(data: Optional[Sequence[dict]]) -> "EnvironmentTimeline":
+        if not data:
+            return EnvironmentTimeline()
+        return EnvironmentTimeline(tuple(Perturbation.from_dict(item) for item in data))
+
+
+def direct_perturbed_probabilities(
+    base_probability: float,
+    persistent_probability: float,
+    perturbation: Perturbation,
+    event_times: Sequence[float],
+) -> list[float]:
+    """Direct short-circuit reference for one channel at known event times."""
+    results = []
+    for time in event_times:
+        if perturbation.active_at(time):
+            results.append(persistent_probability)
+        else:
+            results.append(base_probability)
+    return results
+
+
 _CORRELATED_ERROR_OPERATORS = {
     "bit_flip": X,
     "phase_flip": Z,

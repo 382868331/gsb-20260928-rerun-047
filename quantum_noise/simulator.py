@@ -10,7 +10,13 @@ from typing import Optional, Sequence
 
 from .gates import Circuit
 from .linalg import Matrix, dagger, embedding, matmul, trace, zeros
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
+from .noise import (
+    CorrelatedNoiseGroup,
+    EnvironmentTimeline,
+    NoiseModel,
+    NoiseRule,
+    TimeSchedule,
+)
 
 
 @dataclass(frozen=True)
@@ -56,16 +62,20 @@ def simulate(
     circuit: Circuit,
     noise_model: Optional[NoiseModel] = None,
     schedule: Optional[TimeSchedule] = None,
+    timeline: Optional[EnvironmentTimeline] = None,
 ) -> SimulationResult:
     rules = list(noise_model.rules if noise_model is not None else [])
     groups = list(noise_model.groups if noise_model is not None else [])
     if schedule is not None:
         schedule = schedule.normalized(len(circuit.operations))
+    timeline = timeline or EnvironmentTimeline()
+    if timeline.perturbations and schedule is None:
+        raise ValueError("perturbations require a TimeSchedule to identify physical times")
     _validate_rules(circuit, rules)
     _validate_groups(circuit, groups)
 
     if not groups:
-        state, classical = _evolve(circuit, rules, {}, schedule=schedule)
+        state, classical = _evolve(circuit, rules, {}, schedule=schedule, timeline=timeline)
         environment_records = None
         measurement_conditions = None
         if schedule is not None or any(op.name == "measure" for op in circuit.operations):
@@ -73,13 +83,15 @@ def simulate(
             measurement_conditions = tuple(
                 _measurement_conditions(circuit, register) for register in registers
             ) or None
+            timeline_records = timeline.change_records() if timeline.perturbations else None
             environment_records = tuple(
                 {
                     "branch": "".join(str(bit) for bit in register),
                     "probability": 1.0 if not register else None,
                     "measurement_conditions": _measurement_conditions(circuit, register),
                     "schedule": schedule.to_dict() if schedule is not None else None,
-                    "events": _rule_environment_events(circuit, rules, schedule),
+                    "events": _rule_environment_events(circuit, rules, schedule, timeline),
+                    "timeline": timeline_records,
                 }
                 for register in _possible_registers(circuit)
             )
@@ -101,12 +113,12 @@ def simulate(
     registers = [
         register
         for register in _possible_registers(circuit)
-        if _branch_probability(circuit, register, schedule) > 1e-15
+        if _branch_probability(circuit, register, schedule, timeline) > 1e-15
     ]
     measurement_conditions = tuple(
         _measurement_conditions(circuit, register) for register in registers
     )
-    combined = _combined_branch_trajectories(circuit, groups, schedule)
+    combined = _combined_branch_trajectories(circuit, groups, schedule, timeline)
     size = 2**circuit.num_qubits
     state = zeros(size, size)
     classical_total: dict[str, float] = {}
@@ -118,6 +130,7 @@ def simulate(
             rules,
             {branch: events},
             schedule=schedule,
+            timeline=timeline,
             only_branch=branch,
         )
         for row in range(size):
@@ -169,7 +182,10 @@ def _possible_registers(circuit: Circuit) -> list[tuple[int, ...]]:
 
 
 def _branch_probability(
-    circuit: Circuit, register: tuple[int, ...], schedule: Optional[TimeSchedule]
+    circuit: Circuit,
+    register: tuple[int, ...],
+    schedule: Optional[TimeSchedule],
+    timeline: Optional[EnvironmentTimeline] = None,
 ) -> float:
     if not register:
         return 1.0
@@ -178,6 +194,7 @@ def _branch_probability(
         [],
         {},
         schedule=schedule,
+        timeline=timeline or EnvironmentTimeline(),
         only_branch="".join(str(bit) for bit in register),
     )
     return trace(state).real
@@ -235,17 +252,28 @@ def _rule_environment_events(
     circuit: Circuit,
     rules: Sequence[NoiseRule],
     schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
 ) -> list[dict[str, object]]:
     events = []
     for rule in rules:
         if rule.after_gate is None:
             continue
+        event_time = schedule.event_time(rule.after_gate) if schedule is not None else None
+        perturbation, effective_probability = (
+            timeline.effective_at(event_time, rule.channel)
+            if event_time is not None
+            else (None, None)
+        )
         events.append(
             {
                 "site": [rule.after_gate, rule.qubits[0]],
-                "time": schedule.event_time(rule.after_gate) if schedule is not None else None,
+                "time": event_time,
                 "channel": rule.channel,
                 "probability": rule.probability,
+                "effective_probability": rule.probability
+                if effective_probability is None
+                else effective_probability,
+                "perturbation": perturbation.name if perturbation is not None else None,
             }
         )
     return events
@@ -255,6 +283,7 @@ def _combined_branch_trajectories(
     circuit: Circuit,
     groups: Sequence[CorrelatedNoiseGroup],
     schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
 ) -> list[
     tuple[
         str,
@@ -270,7 +299,7 @@ def _combined_branch_trajectories(
         branch_key = "".join(str(bit) for bit in branch)
         experienced = _experienced_indices(circuit, branch, groups, schedule)
         for pattern, weight, events, states, records in _combined_trajectories(
-            groups, experienced, schedule
+            groups, experienced, schedule, timeline
         ):
             combined.append(
                 (
@@ -285,6 +314,9 @@ def _combined_branch_trajectories(
                         "environment_states": states,
                         "measurement_conditions": _measurement_conditions(circuit, branch),
                         "events": records,
+                        "timeline": timeline.change_records()
+                        if timeline.perturbations
+                        else None,
                     },
                 )
             )
@@ -295,6 +327,7 @@ def _combined_trajectories(
     groups: Sequence[CorrelatedNoiseGroup],
     experienced_by_group: list[list[int]],
     schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
 ) -> list[
     tuple[
         str,
@@ -316,7 +349,7 @@ def _combined_trajectories(
         entries = []
         experienced_indices = experienced_by_group[group_index]
         for pattern, weight, transitions in _group_trajectories(
-            group, experienced_indices, schedule
+            group, experienced_indices, schedule, timeline
         ):
             events: dict[int, list[tuple[Matrix, tuple[int, ...]]]] = {}
             for site_index, bit in zip(experienced_indices, pattern):
@@ -360,8 +393,8 @@ def _group_trajectories(
     group: CorrelatedNoiseGroup,
     experienced_indices: Sequence[int],
     schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
 ) -> list[tuple[tuple[int, ...], float, list[dict]]]:
-    p = group.probability
     results: list[tuple[tuple[int, ...], float, list[dict]]] = [((), 1.0, [])]
     previous_time: Optional[float] = None
     previous_site: Optional[tuple[int, int]] = None
@@ -369,7 +402,22 @@ def _group_trajectories(
         after_gate, qubit = group.sites[site_index]
         current_time = None if schedule is None else schedule.event_time(after_gate)
         elapsed = None if previous_time is None or current_time is None else current_time - previous_time
-        correlation = group.correlation_after(elapsed)
+        perturbation, effective_probability = (
+            timeline.effective_at(current_time, group.channel)
+            if current_time is not None
+            else (None, None)
+        )
+        p = group.probability if effective_probability is None else effective_probability
+        if elapsed is None:
+            correlation = group.correlation
+        else:
+            correlation = timeline.correlation_over(
+                group.correlation,
+                previous_time,
+                current_time,
+                group.correlation_time,
+                group.channel,
+            )
         stay_error = min(1.0, max(0.0, p + correlation * (1.0 - p)))
         become_error = min(1.0, max(0.0, p * (1.0 - correlation)))
         next_results = []
@@ -381,7 +429,9 @@ def _group_trajectories(
                     "time": current_time,
                     "elapsed": elapsed,
                     "correlation": correlation,
+                    "probability": p,
                     "state": bit,
+                    "perturbation": perturbation.name if perturbation is not None else None,
                     "previous_site": list(previous_site) if previous_site is not None else None,
                 }
                 next_results.append(
@@ -402,6 +452,7 @@ def _evolve(
     rules: Sequence[NoiseRule],
     error_events: dict[str, dict[int, list[tuple[Matrix, tuple[int, ...]]]]] | dict[int, list[tuple[Matrix, tuple[int, ...]]]],
     schedule: Optional[TimeSchedule] = None,
+    timeline: Optional[EnvironmentTimeline] = None,
     only_branch: str = "",
 ) -> tuple[Matrix, dict[str, float]]:
     """Propagate branch states through gates, measurements and noise.
@@ -415,11 +466,33 @@ def _evolve(
     branches: list[tuple[Matrix, tuple[int, ...]]] = [
         (zero_state(circuit.num_qubits), ())
     ]
+    timeline = timeline or EnvironmentTimeline()
 
     def apply_noise(state: Matrix, index: Optional[int], register: tuple[int, ...]) -> Matrix:
         for rule in rules:
             if rule.after_gate == index:
-                state = _apply_rule(state, rule, circuit.num_qubits)
+                event_time = (
+                    schedule.event_time(index)
+                    if schedule is not None and index is not None
+                    else None
+                )
+                _perturbation, probability = (
+                    timeline.effective_at(event_time, rule.channel)
+                    if event_time is not None
+                    else (None, None)
+                )
+                effective_rule = (
+                    rule
+                    if probability is None
+                    else NoiseRule(
+                        channel=rule.channel,
+                        probability=probability,
+                        qubits=rule.qubits,
+                        after_gate=rule.after_gate,
+                        params=dict(rule.params),
+                    )
+                )
+                state = _apply_rule(state, effective_rule, circuit.num_qubits)
         if error_events and not isinstance(next(iter(error_events)), int):
             branch_key = "".join(str(bit) for bit in register)
             branch_events = error_events.get(branch_key, {})  # type: ignore[union-attr]
@@ -494,10 +567,13 @@ def _measure(
 
 
 def compare_ideal_and_noisy(
-    circuit: Circuit, noise_model: NoiseModel, schedule: Optional[TimeSchedule] = None
+    circuit: Circuit,
+    noise_model: NoiseModel,
+    schedule: Optional[TimeSchedule] = None,
+    timeline: Optional[EnvironmentTimeline] = None,
 ) -> tuple[SimulationResult, SimulationResult]:
-    return simulate(circuit, schedule=schedule), simulate(
-        circuit, noise_model, schedule=schedule
+    return simulate(circuit, schedule=schedule, timeline=timeline), simulate(
+        circuit, noise_model, schedule=schedule, timeline=timeline
     )
 
 

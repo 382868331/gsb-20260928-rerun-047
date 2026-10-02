@@ -8,15 +8,15 @@ import os
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
-from .noise import NoiseModel, TimeSchedule
+from .noise import EnvironmentTimeline, NoiseModel, Perturbation, TimeSchedule
 from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
 
 
-ARCHIVE_SCHEMA_VERSION = 3
+ARCHIVE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -27,6 +27,7 @@ class ExperimentBatch:
     base_seed: int
     name: str = "experiment"
     schedule: Optional[TimeSchedule] = None
+    timeline: Optional[EnvironmentTimeline] = None
 
     def seeds(self, repeats: int) -> list[int]:
         if repeats <= 0:
@@ -41,6 +42,68 @@ class ExperimentBatch:
         if self.schedule is None:
             return None
         return self.schedule.normalized(len(self.circuit.operations))
+
+    @property
+    def normalized_timeline(self) -> EnvironmentTimeline:
+        if self.timeline is None:
+            return EnvironmentTimeline()
+        if self.schedule is None and self.timeline.perturbations:
+            raise ValueError("perturbations require a schedule")
+        return self.timeline
+
+    def with_perturbations(
+        self,
+        perturbations: Sequence[Perturbation],
+        name: Optional[str] = None,
+    ) -> "ExperimentBatch":
+        """Derive an independent run from the same experiment specification."""
+        return ExperimentBatch(
+            circuit=self.circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=name or self.name,
+            schedule=self.schedule,
+            timeline=EnvironmentTimeline(tuple(perturbations)),
+        )
+
+
+@dataclass(frozen=True)
+class ExperimentPrefix:
+    """A common experiment prefix from which perturbation times can be forked.
+
+    Perturbations contained in ``committed`` are treated as environmental
+    history: forking may append disturbances at or after ``anchor_time`` but
+    cannot rewrite facts before the fork point.
+    """
+
+    batch: ExperimentBatch
+    anchor_time: float = 0.0
+    committed: Sequence[Perturbation] = ()
+
+    def __post_init__(self) -> None:
+        if self.batch.schedule is None:
+            raise ValueError("an experiment prefix requires a TimeSchedule")
+        if self.anchor_time < 0.0:
+            raise ValueError("anchor_time must be nonnegative")
+
+    def fork(self, name: str, perturbations: Sequence[Perturbation]) -> ExperimentBatch:
+        future = tuple(perturbations)
+        for perturbation in future:
+            if perturbation.start < self.anchor_time:
+                raise ValueError(
+                    f"cannot rewrite perturbation {perturbation.name!r} before the fork point"
+                )
+        timeline = EnvironmentTimeline(tuple(self.committed) + future)
+        return ExperimentBatch(
+            circuit=self.batch.circuit,
+            noise_model=self.batch.noise_model,
+            shots=self.batch.shots,
+            base_seed=self.batch.base_seed,
+            name=name,
+            schedule=self.batch.schedule,
+            timeline=timeline,
+        )
 
 
 @dataclass(frozen=True)
@@ -63,6 +126,7 @@ class BatchRun:
     environment_changes: Optional[list[dict[str, Any]]] = None
     measurement_conditions: Optional[list[dict[str, Any]]] = None
     schedule: Optional[TimeSchedule] = None
+    timeline: Optional[EnvironmentTimeline] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -95,6 +159,7 @@ class BatchRun:
             "environment_changes": self.environment_changes,
             "measurement_conditions": self.measurement_conditions,
             "schedule": self.schedule.to_dict() if self.schedule is not None else None,
+            "timeline": self.timeline.to_list() if self.timeline is not None else None,
         }
 
 
@@ -107,7 +172,7 @@ def run_batch(
         else None
     )
     ideal_result, noisy_result = compare_ideal_and_noisy(
-        batch.circuit, batch.noise_model, schedule
+        batch.circuit, batch.noise_model, schedule, batch.normalized_timeline
     )
     correlated = bool(batch.noise_model.groups)
     trajectory_records = None
@@ -176,6 +241,7 @@ def run_batch(
                 environment_changes=environment_changes,
                 measurement_conditions=measurement_conditions,
                 schedule=schedule,
+                timeline=batch.normalized_timeline,
             )
         )
     return runs
@@ -200,6 +266,7 @@ def save_batch_archive(
             "circuit": circuit_to_dict(batch.circuit),
             "noise_model": batch.noise_model.to_dict(),
             "schedule": batch.schedule.to_dict() if batch.schedule is not None else None,
+            "timeline": batch.normalized_timeline.to_list(),
         },
         "runs": [run.to_dict() for run in runs],
     }
@@ -220,6 +287,7 @@ def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]
         schedule=TimeSchedule.from_dict(data["schedule"])
         if data.get("schedule") is not None
         else None,
+        timeline=EnvironmentTimeline.from_list(data.get("timeline")),
     )
     return batch, payload["runs"]
 
@@ -305,6 +373,7 @@ def _batch_payload(batch: ExperimentBatch) -> dict[str, Any]:
         "schedule": batch.normalized_schedule.to_dict()
         if batch.normalized_schedule is not None
         else None,
+        "timeline": batch.normalized_timeline.to_list(),
     }
 
 
@@ -408,6 +477,7 @@ class ResumableBatch:
             schedule=TimeSchedule.from_dict(batch_data["schedule"])
             if batch_data.get("schedule") is not None
             else None,
+            timeline=EnvironmentTimeline.from_list(batch_data.get("timeline")),
         )
         execution = cls(
             path=Path(path),
@@ -462,11 +532,25 @@ def start_resumable_batch(
     repeats: int = 1,
     pause_after_measurement: bool = False,
     pause_after_idle: bool = False,
+    pause_at_perturbation: Optional[tuple[str, str]] = None,
 ) -> ResumableBatch:
     pause_point = None
     if pause_after_measurement or pause_after_idle:
         pause_point = {
             "kind": "measurement" if pause_after_measurement else "idle",
+            "resumable": True,
+        }
+    if pause_at_perturbation is not None:
+        name, phase = pause_at_perturbation
+        if phase not in ("start", "overlap", "end"):
+            raise ValueError("perturbation pause phase must be start, overlap or end")
+        names = {item.name for item in batch.normalized_timeline.perturbations}
+        if name not in names:
+            raise ValueError(f"unknown perturbation {name!r}")
+        pause_point = {
+            "kind": "perturbation",
+            "perturbation": name,
+            "phase": phase,
             "resumable": True,
         }
     return ResumableBatch.start(path, batch, repeats, pause_point)
@@ -538,6 +622,7 @@ def _batch_run_from_dict(data: dict[str, Any]) -> BatchRun:
         schedule=TimeSchedule.from_dict(data["schedule"])
         if data.get("schedule") is not None
         else None,
+        timeline=EnvironmentTimeline.from_list(data.get("timeline")),
     )
 
 

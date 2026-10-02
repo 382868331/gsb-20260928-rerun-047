@@ -7,6 +7,7 @@ from quantum_noise.experiments import (
     BatchCheckpoint,
     ExperimentBatch,
     ExperimentTask,
+    ExperimentPrefix,
     compare_schedules,
     load_batch,
     rerun_archive,
@@ -17,7 +18,15 @@ from quantum_noise.experiments import (
     start_resumable_batch,
 )
 from quantum_noise.gates import Circuit, X, Z, bell_circuit
-from quantum_noise.noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
+from quantum_noise.noise import (
+    CorrelatedNoiseGroup,
+    EnvironmentTimeline,
+    NoiseModel,
+    NoiseRule,
+    Perturbation,
+    TimeSchedule,
+    direct_perturbed_probabilities,
+)
 from quantum_noise.simulator import simulate, validate_density_matrix
 
 
@@ -460,6 +469,182 @@ class CheckpointTests(unittest.TestCase):
                 [r.noisy_counts for r in second[key]],
                 [r.noisy_counts for r in direct[key]],
             )
+
+class PerturbationTests(unittest.TestCase):
+    def short_circuit(self):
+        return Circuit(1).h(0).h(0)
+
+    def test_idle_event_uses_actual_perturbation_time(self):
+        circuit = self.short_circuit()
+        model = NoiseModel("bf", [NoiseRule("bit_flip", 0.1, (0,), after_gate=1)])
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 5.0), "idle")
+        during_idle = Perturbation(4.0, 8.0, 0.4, name="during-idle")
+        after_idle = Perturbation(4.0, 6.0, 0.4, name="restored-before-event")
+        at_event = Perturbation(4.0, 7.0, 0.4, name="half-open-end")
+        affected = simulate(circuit, model, schedule, EnvironmentTimeline((during_idle,)))
+        restored = simulate(circuit, model, schedule, EnvironmentTimeline((after_idle,)))
+        boundary = simulate(circuit, model, schedule, EnvironmentTimeline((at_event,)))
+        baseline = simulate(circuit, model, schedule)
+        self.assertAlmostEqual(restored.probabilities["0"], baseline.probabilities["0"], places=12)
+        self.assertAlmostEqual(boundary.probabilities["0"], baseline.probabilities["0"], places=12)
+        self.assertNotAlmostEqual(affected.probabilities["0"], baseline.probabilities["0"])
+
+    def test_overlapping_perturbations_use_documented_priority(self):
+        timeline = EnvironmentTimeline(
+            (
+                Perturbation(1.0, 3.0, 0.2, name="weak"),
+                Perturbation(1.5, 2.5, 0.5, name="strong", priority=10),
+                Perturbation(2.0, 2.25, 0.7, name="ignored-later"),
+            )
+        )
+        self.assertEqual(timeline.effective_at(1.75, "bit_flip"), (timeline.perturbations[1], 0.5))
+        self.assertEqual(timeline.effective_at(2.1, "bit_flip"), (timeline.perturbations[1], 0.5))
+        self.assertEqual(timeline.effective_at(2.75, "bit_flip"), (timeline.perturbations[0], 0.2))
+        self.assertEqual(timeline.effective_at(3.0, "bit_flip"), (None, None))
+
+    def test_channel_targets_leave_other_channels_at_baseline(self):
+        timeline = EnvironmentTimeline(
+            (Perturbation(1.0, 3.0, 0.5, targets=frozenset({"phase_flip"})),)
+        )
+        self.assertEqual(timeline.effective_at(2.0, "phase_flip")[1], 0.5)
+        self.assertIsNone(timeline.effective_at(2.0, "bit_flip")[1])
+
+    def test_mid_operation_correlation_perturbation_depends_on_actual_time(self):
+        circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+        group = CorrelatedNoiseGroup(
+            "bit_flip",
+            ((0, 0), (1, 0)),
+            probability=0.2,
+            correlation=1.0,
+            correlation_time=1.0,
+        )
+        model = NoiseModel("time", (), (group,))
+        schedule = TimeSchedule((2.0, 2.0), name="operations")
+        none = simulate(circuit, model, schedule)
+        disturbance = Perturbation(2.0, 3.0, 0.2, correlation_time_scale=0.0, name="reset")
+        middle = simulate(circuit, model, schedule, EnvironmentTimeline((disturbance,)))
+        instant = Perturbation(2.0, 2.0, 0.0, name="boundary-only")
+        boundary = simulate(circuit, model, schedule, EnvironmentTimeline((instant,)))
+        self.assertAlmostEqual(none.probabilities["0"], 0.32 * (1 - 0.1353352832366127), places=8)
+        self.assertAlmostEqual(middle.probabilities["0"], 0.32, places=9)
+        self.assertAlmostEqual(boundary.probabilities["0"], none.probabilities["0"], places=12)
+
+    def test_direct_controls_match_no_persistent_and_instantaneous_cases(self):
+        disturbance = Perturbation(1.0, 3.0, 0.6, name="short")
+        direct = direct_perturbed_probabilities(0.1, 0.6, disturbance, (0.5, 1.0, 2.0, 3.0))
+        self.assertEqual(direct, [0.1, 0.6, 0.6, 0.1])
+        instant = Perturbation(1.0, 1.0, 0.9, name="instant")
+        self.assertEqual(
+            direct_perturbed_probabilities(0.1, 0.9, instant, (0.0, 1.0, 2.0)),
+            [0.1, 0.1, 0.1],
+        )
+
+    def test_prefix_fork_preserves_history_but_allows_future_changes(self):
+        circuit = self.short_circuit()
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 5.0), "idle")
+        base = ExperimentBatch(
+            circuit,
+            NoiseModel("bf", [NoiseRule("bit_flip", 0.1, (0,), after_gate=1)]),
+            shots=64,
+            base_seed=8,
+            name="prefix",
+            schedule=schedule,
+        )
+        history = (Perturbation(0.0, 2.0, 0.4, name="history"),)
+        prefix = ExperimentPrefix(base, anchor_time=2.0, committed=history)
+        early = prefix.fork("early", [Perturbation(2.0, 7.0, 0.5)])
+        late = prefix.fork("late", [Perturbation(2.0, 7.001, 0.5)])
+        self.assertEqual(early.timeline.perturbations[0].name, "history")
+        self.assertEqual(late.timeline.perturbations[0].name, "history")
+        self.assertEqual(len(early.timeline.perturbations), 2)
+        self.assertNotEqual(
+            run_batch(early)[0].noisy_probabilities,
+            run_batch(late)[0].noisy_probabilities,
+        )
+        with self.assertRaises(ValueError):
+            prefix.fork("rewrite", [Perturbation(1.5, 2.5, 0.7)])
+
+    def test_perturbation_archive_and_pause_replay_original_batch(self):
+        circuit = self.short_circuit()
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 5.0), "idle")
+        timeline = EnvironmentTimeline((Perturbation(2.5, 4.0, 0.4, name="pulse"),))
+        batch = ExperimentBatch(
+            circuit,
+            NoiseModel("bf", [NoiseRule("bit_flip", 0.1, (0,), after_gate=1)]),
+            shots=80,
+            base_seed=91,
+            name="pulsed",
+            schedule=schedule,
+            timeline=timeline,
+        )
+        runs = run_batch(batch, repeats=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pulse.json"
+            save_batch_archive(path, batch, runs)
+            reproduced = rerun_archive(path)
+            self.assertEqual(
+                [run.noisy_counts for run in runs],
+                [run.noisy_counts for run in reproduced],
+            )
+            checkpoint = Path(directory) / "checkpoint.json"
+            paused = start_resumable_batch(
+                checkpoint, batch, repeats=3, pause_at_perturbation=("pulse", "end")
+            )
+            self.assertEqual(paused.pause_point["phase"], "end")
+            resumed = resume_batch(checkpoint)
+        expected = run_batch(batch, repeats=3)
+        self.assertEqual(
+            [run.noisy_counts for run in resumed.runs],
+            [run.noisy_counts for run in expected],
+        )
+
+    def test_execution_order_does_not_change_perturbed_batches(self):
+        circuit = self.short_circuit()
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 5.0), "idle")
+        tasks = []
+        for name, window in (("early", (1.0, 4.0)), ("late", (3.0, 5.5))):
+            batch = ExperimentBatch(
+                circuit,
+                NoiseModel(name, [NoiseRule("bit_flip", 0.1, (0,), after_gate=1)]),
+                shots=72,
+                base_seed=61,
+                name=name,
+                schedule=schedule,
+                timeline=EnvironmentTimeline((Perturbation(*window, 0.4, name=name),)),
+            )
+            tasks.append(ExperimentTask(batch, 1, name))
+        direct = {task.task_key: run_batch(task.batch) for task in tasks}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "checkpoint.json"
+            first = BatchCheckpoint(path).resume(tasks, order=["late", "early"])
+        for key in direct:
+            self.assertEqual(first[key][0].noisy_counts, direct[key][0].noisy_counts)
+
+    def test_operation_segmentation_keeps_same_temporal_meaning(self):
+        group_kwargs = dict(
+            channel="bit_flip",
+            sites=((0, 0), (1, 0)),
+            probability=0.2,
+            correlation=1.0,
+            correlation_time=1.0,
+        )
+        circuit = Circuit(1).rx(0, pi / 2).rx(0, pi / 2)
+        schedule = TimeSchedule((2.0, 2.0), name="two-operations")
+        timeline = EnvironmentTimeline((Perturbation(1.0, 3.0, 0.2),))
+        result = simulate(
+            circuit,
+            NoiseModel("segments", (), (CorrelatedNoiseGroup(**group_kwargs),)),
+            schedule,
+            timeline,
+        )
+        events = result.environment_records[0]["events"]["correlated"]
+        self.assertEqual([record["time"] for record in events], [2.0, 4.0])
+        self.assertEqual([record["probability"] for record in events], [0.2, 0.2])
+        self.assertAlmostEqual(events[1]["correlation"], 0.1353352832366127, places=12)
+        schedule_records = result.environment_records[0]["timeline"]
+        self.assertEqual(schedule_records[0]["time"], 1.0)
+        self.assertEqual(schedule_records[1]["time"], 3.0)
+        self.assertEqual(schedule_records[1]["restored_environment"], "baseline")
 
 
 if __name__ == "__main__":

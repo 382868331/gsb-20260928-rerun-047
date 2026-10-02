@@ -25,6 +25,7 @@ python examples/single_qubit_ordering.py
 python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
+python examples/perturbation_timing_comparison.py
 ```
 
 命令行示例：
@@ -56,6 +57,12 @@ batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 2026100
 ```
 
 `compare_schedules` 用同一操作序列生成多个独立命名批次；`save_schedule_comparison` 为每个时间安排分别写入环境变化、测量条件与统计结果。`start_resumable_batch`/`resume_batch` 和 `BatchCheckpoint.resume(..., order=[...])` 用于暂停恢复和检查执行顺序无关性。
+
+### 外部扰动时间窗
+
+`Perturbation(start, end, probability=...)` 表示一段 `[start, end)` 的外部扰动；事件按 `TimeSchedule` 的实际时间取环境状态，落在空闲区间或操作中途都不会被推迟到下一次操作。`end` 边界恢复为基础环境，因此 `start == end` 的瞬时扰动是无效果的边界对照。多个扰动可重叠：高 `priority` 决定当前环境，同优先级以后加入者为准；扰动结束后自动恢复到基础条件或仍在生效的其他扰动。
+
+`ExperimentPrefix.fork(name, perturbations)` 从同一前缀派生不同扰动时刻的独立批次，并保留锚点之前已发生的扰动；尝试把新扰动写到锚点之前会报错。`ExperimentBatch.with_perturbations(...)` 用于没有共同历史约束的直接派生。暂停恢复可使用 `start_resumable_batch(..., pause_at_perturbation=(name, phase))`，阶段为 `start`、`overlap` 或 `end`；恢复时重放原批次，采样结果与直接执行及改变检查点执行顺序一致。`direct_perturbed_probabilities` 提供无扰动、持续扰动和半开区间瞬时边界的短线路直接对照。
 
 ## 最小代码示例
 

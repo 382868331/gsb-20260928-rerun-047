@@ -5,6 +5,7 @@ from .experiments import (
     BatchRun,
     ExperimentBatch,
     ExperimentTask,
+    ExperimentPrefix,
     ResumableBatch,
     compare_schedules,
     resume_batch,
@@ -14,7 +15,15 @@ from .experiments import (
     start_resumable_batch,
 )
 from .gates import Circuit, bell_circuit, ghz_circuit
-from .noise import CorrelatedNoiseGroup, NoiseModel, NoiseRule, TimeSchedule
+from .noise import (
+    CorrelatedNoiseGroup,
+    EnvironmentTimeline,
+    NoiseModel,
+    NoiseRule,
+    Perturbation,
+    TimeSchedule,
+    direct_perturbed_probabilities,
+)
 from .simulator import (
     NoiseTrajectory,
     SimulationResult,
@@ -31,8 +40,12 @@ __all__ = [
     "CorrelatedNoiseGroup",
     "DifferenceTest",
     "ExperimentBatch",
+    "ExperimentPrefix",
     "NoiseModel",
     "NoiseRule",
+    "Perturbation",
+    "EnvironmentTimeline",
+    "direct_perturbed_probabilities",
     "NoiseTrajectory",
     "ProportionEstimate",
     "TimeSchedule",
