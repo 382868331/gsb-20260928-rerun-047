@@ -1,0 +1,210 @@
+{
+  "schema_version": 4,
+  "batch": {
+    "name": "mid-idle",
+    "shots": 2000,
+    "base_seed": 20261002,
+    "circuit": {
+      "num_qubits": 1,
+      "operations": [
+        {
+          "name": "h",
+          "qubits": [
+            0
+          ],
+          "angle": null
+        },
+        {
+          "name": "h",
+          "qubits": [
+            0
+          ],
+          "angle": null
+        }
+      ]
+    },
+    "noise_model": {
+      "name": "idle-bit-flip",
+      "rules": [
+        {
+          "channel": "bit_flip",
+          "probability": 0.1,
+          "qubits": [
+            0
+          ],
+          "after_gate": 1,
+          "params": {}
+        }
+      ],
+      "groups": []
+    },
+    "schedule": {
+      "name": "long-idle",
+      "operation_durations": [
+        1.0,
+        1.0
+      ],
+      "idle_after": [
+        0.0,
+        5.0
+      ]
+    },
+    "timeline": [
+      {
+        "name": "pulse",
+        "start": 4.0,
+        "end": 8.0,
+        "probability": 0.4,
+        "correlation_time_scale": 1.0,
+        "targets": null,
+        "priority": 0
+      }
+    ]
+  },
+  "runs": [
+    {
+      "batch_name": "mid-idle",
+      "shots": 2000,
+      "base_seed": 20261002,
+      "repeat_index": 0,
+      "seed": 4857571879141736422,
+      "ideal_probabilities": {
+        "0": 1.0,
+        "1": 0.0
+      },
+      "noisy_probabilities": {
+        "0": 0.6,
+        "1": 0.39999999999999997
+      },
+      "ideal_counts": {
+        "0": 2000,
+        "1": 0
+      },
+      "noisy_counts": {
+        "0": 1201,
+        "1": 799
+      },
+      "difference_tests": {
+        "0": {
+          "observed_difference": -0.39949999999999997,
+          "standard_error": 0.010952163028370241,
+          "confidence_95": [
+            -0.42096623953560564,
+            -0.3780337604643943
+          ],
+          "significant": false,
+          "exact_difference": -0.4,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        },
+        "1": {
+          "observed_difference": 0.3995,
+          "standard_error": 0.010952163028370241,
+          "confidence_95": [
+            0.37803376046439435,
+            0.4209662395356057
+          ],
+          "significant": false,
+          "exact_difference": 0.39999999999999997,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        }
+      },
+      "noise_seed": null,
+      "measure_seed": null,
+      "noise_trajectories": null,
+      "environment_changes": [
+        {
+          "branch": "",
+          "probability": 1.0,
+          "measurement_conditions": {
+            "register": {},
+            "operations": []
+          },
+          "schedule": {
+            "name": "long-idle",
+            "operation_durations": [
+              1.0,
+              1.0
+            ],
+            "idle_after": [
+              0.0,
+              5.0
+            ]
+          },
+          "events": [
+            {
+              "site": [
+                1,
+                0
+              ],
+              "time": 7.0,
+              "channel": "bit_flip",
+              "probability": 0.1,
+              "effective_probability": 0.4,
+              "perturbation": "pulse"
+            }
+          ],
+          "timeline": [
+            {
+              "perturbation": "pulse",
+              "kind": "start",
+              "time": 4.0,
+              "time_inclusive": true,
+              "probability": 0.4,
+              "correlation_time_scale": 1.0,
+              "overlapping": [],
+              "environment_owner": "pulse",
+              "restored": false,
+              "restored_environment": "pulse"
+            },
+            {
+              "perturbation": "pulse",
+              "kind": "end",
+              "time": 8.0,
+              "time_inclusive": false,
+              "probability": null,
+              "correlation_time_scale": 1.0,
+              "overlapping": [],
+              "environment_owner": null,
+              "restored": true,
+              "restored_environment": "baseline"
+            }
+          ]
+        }
+      ],
+      "measurement_conditions": [
+        {
+          "register": {},
+          "operations": []
+        }
+      ],
+      "schedule": {
+        "name": "long-idle",
+        "operation_durations": [
+          1.0,
+          1.0
+        ],
+        "idle_after": [
+          0.0,
+          5.0
+        ]
+      },
+      "timeline": [
+        {
+          "name": "pulse",
+          "start": 4.0,
+          "end": 8.0,
+          "probability": 0.4,
+          "correlation_time_scale": 1.0,
+          "targets": null,
+          "priority": 0
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,165 @@
+{
+  "schema_version": 4,
+  "batch": {
+    "name": "prefix",
+    "shots": 2000,
+    "base_seed": 20261002,
+    "circuit": {
+      "num_qubits": 1,
+      "operations": [
+        {
+          "name": "h",
+          "qubits": [
+            0
+          ],
+          "angle": null
+        },
+        {
+          "name": "h",
+          "qubits": [
+            0
+          ],
+          "angle": null
+        }
+      ]
+    },
+    "noise_model": {
+      "name": "idle-bit-flip",
+      "rules": [
+        {
+          "channel": "bit_flip",
+          "probability": 0.1,
+          "qubits": [
+            0
+          ],
+          "after_gate": 1,
+          "params": {}
+        }
+      ],
+      "groups": []
+    },
+    "schedule": {
+      "name": "long-idle",
+      "operation_durations": [
+        1.0,
+        1.0
+      ],
+      "idle_after": [
+        0.0,
+        5.0
+      ]
+    },
+    "timeline": []
+  },
+  "runs": [
+    {
+      "batch_name": "prefix",
+      "shots": 2000,
+      "base_seed": 20261002,
+      "repeat_index": 0,
+      "seed": 3927260179882148083,
+      "ideal_probabilities": {
+        "0": 1.0,
+        "1": 0.0
+      },
+      "noisy_probabilities": {
+        "0": 0.9,
+        "1": 0.1
+      },
+      "ideal_counts": {
+        "0": 2000,
+        "1": 0
+      },
+      "noisy_counts": {
+        "0": 1795,
+        "1": 205
+      },
+      "difference_tests": {
+        "0": {
+          "observed_difference": -0.10250000000000004,
+          "standard_error": 0.006782099601155973,
+          "confidence_95": [
+            -0.11579291521826574,
+            -0.08920708478173434
+          ],
+          "significant": false,
+          "exact_difference": -0.09999999999999998,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        },
+        "1": {
+          "observed_difference": 0.1025,
+          "standard_error": 0.006782099601155972,
+          "confidence_95": [
+            0.0892070847817343,
+            0.1157929152182657
+          ],
+          "significant": false,
+          "exact_difference": 0.1,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        }
+      },
+      "noise_seed": null,
+      "measure_seed": null,
+      "noise_trajectories": null,
+      "environment_changes": [
+        {
+          "branch": "",
+          "probability": 1.0,
+          "measurement_conditions": {
+            "register": {},
+            "operations": []
+          },
+          "schedule": {
+            "name": "long-idle",
+            "operation_durations": [
+              1.0,
+              1.0
+            ],
+            "idle_after": [
+              0.0,
+              5.0
+            ]
+          },
+          "events": [
+            {
+              "site": [
+                1,
+                0
+              ],
+              "time": 7.0,
+              "channel": "bit_flip",
+              "probability": 0.1,
+              "effective_probability": 0.1,
+              "perturbation": null
+            }
+          ],
+          "timeline": null
+        }
+      ],
+      "measurement_conditions": [
+        {
+          "register": {},
+          "operations": []
+        }
+      ],
+      "schedule": {
+        "name": "long-idle",
+        "operation_durations": [
+          1.0,
+          1.0
+        ],
+        "idle_after": [
+          0.0,
+          5.0
+        ]
+      },
+      "timeline": []
+    }
+  ]
+}

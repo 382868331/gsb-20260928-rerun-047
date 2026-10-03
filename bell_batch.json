@@ -1,0 +1,143 @@
+{
+  "schema_version": 4,
+  "batch": {
+    "name": "bell-late",
+    "shots": 2000,
+    "base_seed": 20260929,
+    "circuit": {
+      "num_qubits": 2,
+      "operations": [
+        {
+          "name": "h",
+          "qubits": [
+            0
+          ],
+          "angle": null
+        },
+        {
+          "name": "cnot",
+          "qubits": [
+            0,
+            1
+          ],
+          "angle": null
+        }
+      ]
+    },
+    "noise_model": {
+      "name": "bell-late",
+      "rules": [
+        {
+          "channel": "bit_flip",
+          "probability": 0.1,
+          "qubits": [
+            0
+          ],
+          "after_gate": 1,
+          "params": {}
+        }
+      ],
+      "groups": []
+    },
+    "schedule": null,
+    "timeline": []
+  },
+  "runs": [
+    {
+      "batch_name": "bell-late",
+      "shots": 2000,
+      "base_seed": 20260929,
+      "repeat_index": 0,
+      "seed": 16415520228451964485,
+      "ideal_probabilities": {
+        "00": 0.5,
+        "01": 0.0,
+        "10": 0.0,
+        "11": 0.5
+      },
+      "noisy_probabilities": {
+        "00": 0.45,
+        "01": 0.05000000000000001,
+        "10": 0.05000000000000001,
+        "11": 0.45
+      },
+      "ideal_counts": {
+        "00": 998,
+        "01": 0,
+        "10": 0,
+        "11": 1002
+      },
+      "noisy_counts": {
+        "00": 901,
+        "01": 89,
+        "10": 106,
+        "11": 904
+      },
+      "difference_tests": {
+        "00": {
+          "observed_difference": -0.04849999999999999,
+          "standard_error": 0.015772583016107414,
+          "confidence_95": [
+            -0.07941426271157051,
+            -0.017585737288429458
+          ],
+          "significant": true,
+          "exact_difference": -0.04999999999999999,
+          "has_exact_effect": true,
+          "minimum_expected_count": 900.0,
+          "enough_samples": true,
+          "interpretation": "detected lower noisy frequency at 95% confidence"
+        },
+        "01": {
+          "observed_difference": 0.0445,
+          "standard_error": 0.004610843198374892,
+          "confidence_95": [
+            0.03546274733118521,
+            0.05353725266881479
+          ],
+          "significant": false,
+          "exact_difference": 0.05000000000000001,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        },
+        "10": {
+          "observed_difference": 0.053,
+          "standard_error": 0.005009540897128199,
+          "confidence_95": [
+            0.04318129984162873,
+            0.06281870015837127
+          ],
+          "significant": false,
+          "exact_difference": 0.05000000000000001,
+          "has_exact_effect": true,
+          "minimum_expected_count": 0.0,
+          "enough_samples": false,
+          "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+        },
+        "11": {
+          "observed_difference": -0.04899999999999999,
+          "standard_error": 0.015774900950560673,
+          "confidence_95": [
+            -0.07991880586309891,
+            -0.01808119413690107
+          ],
+          "significant": true,
+          "exact_difference": -0.04999999999999999,
+          "has_exact_effect": true,
+          "minimum_expected_count": 900.0,
+          "enough_samples": true,
+          "interpretation": "detected lower noisy frequency at 95% confidence"
+        }
+      },
+      "noise_seed": null,
+      "measure_seed": null,
+      "noise_trajectories": null,
+      "environment_changes": null,
+      "measurement_conditions": null,
+      "schedule": null,
+      "timeline": []
+    }
+  ]
+}

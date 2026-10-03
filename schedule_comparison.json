@@ -1,0 +1,946 @@
+{
+  "schema_version": 4,
+  "comparison_type": "time_schedule",
+  "schedules": {
+    "tight": {
+      "batch": {
+        "name": "tight",
+        "shots": 2000,
+        "base_seed": 20261001,
+        "circuit": {
+          "num_qubits": 1,
+          "operations": [
+            {
+              "name": "rx",
+              "qubits": [
+                0
+              ],
+              "angle": 1.57079632679
+            },
+            {
+              "name": "rx",
+              "qubits": [
+                0
+              ],
+              "angle": 1.57079632679
+            }
+          ]
+        },
+        "noise_model": {
+          "name": "time-correlated",
+          "rules": [],
+          "groups": [
+            {
+              "name": "finite-duration-disturbance",
+              "channel": "bit_flip",
+              "sites": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  0
+                ]
+              ],
+              "probability": 0.2,
+              "correlation": 1.0,
+              "correlation_time": 1.0
+            }
+          ]
+        },
+        "schedule": {
+          "name": "tight",
+          "operation_durations": [
+            0.0,
+            0.0
+          ],
+          "idle_after": [
+            0.0,
+            0.0
+          ]
+        },
+        "timeline": []
+      },
+      "environment_changes": [
+        [
+          {
+            "branch": "",
+            "pattern": "11",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                1,
+                1
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": 0.0,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.2
+          },
+          {
+            "branch": "",
+            "pattern": "00",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                0,
+                0
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": 0.0,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.8
+          }
+        ]
+      ],
+      "measurement_conditions": [
+        [
+          {
+            "register": {},
+            "operations": []
+          }
+        ]
+      ],
+      "statistics": [
+        {
+          "batch_name": "tight",
+          "shots": 2000,
+          "base_seed": 20261001,
+          "repeat_index": 0,
+          "seed": 16816332867900844880,
+          "ideal_probabilities": {
+            "0": 1.232595164407831e-32,
+            "1": 1.0
+          },
+          "noisy_probabilities": {
+            "0": 1.232595164407831e-32,
+            "1": 1.0
+          },
+          "ideal_counts": {
+            "0": 0,
+            "1": 2000
+          },
+          "noisy_counts": {
+            "0": 0,
+            "1": 2000
+          },
+          "difference_tests": {
+            "0": {
+              "observed_difference": 0.0,
+              "standard_error": 0.0,
+              "confidence_95": [
+                0.0,
+                0.0
+              ],
+              "significant": false,
+              "exact_difference": 0.0,
+              "has_exact_effect": false,
+              "minimum_expected_count": 2.465190328815662e-29,
+              "enough_samples": false,
+              "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+            },
+            "1": {
+              "observed_difference": 0.0,
+              "standard_error": 0.0,
+              "confidence_95": [
+                0.0,
+                0.0
+              ],
+              "significant": false,
+              "exact_difference": 0.0,
+              "has_exact_effect": false,
+              "minimum_expected_count": 0.0,
+              "enough_samples": false,
+              "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+            }
+          },
+          "noise_seed": 10043422672298276447,
+          "measure_seed": 6612335496113374560,
+          "noise_trajectories": [
+            {
+              "label": "11",
+              "probability": 0.2,
+              "outcome_probabilities": {
+                "0": 1.232595164407831e-32,
+                "1": 1.0
+              }
+            },
+            {
+              "label": "00",
+              "probability": 0.8,
+              "outcome_probabilities": {
+                "0": 1.232595164407831e-32,
+                "1": 1.0
+              }
+            }
+          ],
+          "environment_changes": [
+            {
+              "branch": "",
+              "pattern": "11",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  1,
+                  1
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": 0.0,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.2
+            },
+            {
+              "branch": "",
+              "pattern": "00",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  0,
+                  0
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": 0.0,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.8
+            }
+          ],
+          "measurement_conditions": [
+            {
+              "register": {},
+              "operations": []
+            }
+          ],
+          "schedule": {
+            "name": "tight",
+            "operation_durations": [
+              0.0,
+              0.0
+            ],
+            "idle_after": [
+              0.0,
+              0.0
+            ]
+          },
+          "timeline": []
+        }
+      ]
+    },
+    "long-idle": {
+      "batch": {
+        "name": "long-idle",
+        "shots": 2000,
+        "base_seed": 20261001,
+        "circuit": {
+          "num_qubits": 1,
+          "operations": [
+            {
+              "name": "rx",
+              "qubits": [
+                0
+              ],
+              "angle": 1.57079632679
+            },
+            {
+              "name": "rx",
+              "qubits": [
+                0
+              ],
+              "angle": 1.57079632679
+            }
+          ]
+        },
+        "noise_model": {
+          "name": "time-correlated",
+          "rules": [],
+          "groups": [
+            {
+              "name": "finite-duration-disturbance",
+              "channel": "bit_flip",
+              "sites": [
+                [
+                  0,
+                  0
+                ],
+                [
+                  1,
+                  0
+                ]
+              ],
+              "probability": 0.2,
+              "correlation": 1.0,
+              "correlation_time": 1.0
+            }
+          ]
+        },
+        "schedule": {
+          "name": "long-idle",
+          "operation_durations": [
+            0.0,
+            0.0
+          ],
+          "idle_after": [
+            0.0,
+            20.0
+          ]
+        },
+        "timeline": []
+      },
+      "environment_changes": [
+        [
+          {
+            "branch": "",
+            "pattern": "11",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                1,
+                1
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 20.0,
+                  "elapsed": 20.0,
+                  "correlation": 2.061153622438558e-09,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.04000000032978458
+          },
+          {
+            "branch": "",
+            "pattern": "10",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                1,
+                0
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 20.0,
+                  "elapsed": 20.0,
+                  "correlation": 2.061153622438558e-09,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.15999999967021541
+          },
+          {
+            "branch": "",
+            "pattern": "01",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                0,
+                1
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 20.0,
+                  "elapsed": 20.0,
+                  "correlation": 2.061153622438558e-09,
+                  "probability": 0.2,
+                  "state": 1,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.15999999967021544
+          },
+          {
+            "branch": "",
+            "pattern": "00",
+            "environment_states": {
+              "finite-duration-disturbance": [
+                0,
+                0
+              ]
+            },
+            "measurement_conditions": {
+              "register": {},
+              "operations": []
+            },
+            "events": {
+              "finite-duration-disturbance": [
+                {
+                  "site": [
+                    0,
+                    0
+                  ],
+                  "time": 0.0,
+                  "elapsed": null,
+                  "correlation": 1.0,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": null
+                },
+                {
+                  "site": [
+                    1,
+                    0
+                  ],
+                  "time": 20.0,
+                  "elapsed": 20.0,
+                  "correlation": 2.061153622438558e-09,
+                  "probability": 0.2,
+                  "state": 0,
+                  "perturbation": null,
+                  "previous_site": [
+                    0,
+                    0
+                  ]
+                }
+              ]
+            },
+            "timeline": null,
+            "probability": 0.6400000003297847
+          }
+        ]
+      ],
+      "measurement_conditions": [
+        [
+          {
+            "register": {},
+            "operations": []
+          }
+        ]
+      ],
+      "statistics": [
+        {
+          "batch_name": "long-idle",
+          "shots": 2000,
+          "base_seed": 20261001,
+          "repeat_index": 0,
+          "seed": 4210466692346490216,
+          "ideal_probabilities": {
+            "0": 1.232595164407831e-32,
+            "1": 1.0
+          },
+          "noisy_probabilities": {
+            "0": 0.3199999993404309,
+            "1": 0.6800000006595692
+          },
+          "ideal_counts": {
+            "0": 0,
+            "1": 2000
+          },
+          "noisy_counts": {
+            "0": 642,
+            "1": 1358
+          },
+          "difference_tests": {
+            "0": {
+              "observed_difference": 0.321,
+              "standard_error": 0.010439324690802563,
+              "confidence_95": [
+                0.30053892360602696,
+                0.34146107639397305
+              ],
+              "significant": false,
+              "exact_difference": 0.3199999993404309,
+              "has_exact_effect": true,
+              "minimum_expected_count": 2.465190328815662e-29,
+              "enough_samples": false,
+              "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+            },
+            "1": {
+              "observed_difference": -0.32099999999999995,
+              "standard_error": 0.01043932469080256,
+              "confidence_95": [
+                -0.341461076393973,
+                -0.3005389236060269
+              ],
+              "significant": false,
+              "exact_difference": -0.3199999993404308,
+              "has_exact_effect": true,
+              "minimum_expected_count": 0.0,
+              "enough_samples": false,
+              "interpretation": "inconclusive: expected counts are too low for a stable binomial test"
+            }
+          },
+          "noise_seed": 851689084181572583,
+          "measure_seed": 9467023307102400473,
+          "noise_trajectories": [
+            {
+              "label": "11",
+              "probability": 0.04000000032978458,
+              "outcome_probabilities": {
+                "0": 1.232595164407831e-32,
+                "1": 1.0
+              }
+            },
+            {
+              "label": "10",
+              "probability": 0.15999999967021541,
+              "outcome_probabilities": {
+                "0": 1.0,
+                "1": 1.232595164407831e-32
+              }
+            },
+            {
+              "label": "01",
+              "probability": 0.15999999967021544,
+              "outcome_probabilities": {
+                "0": 1.0,
+                "1": 1.232595164407831e-32
+              }
+            },
+            {
+              "label": "00",
+              "probability": 0.6400000003297847,
+              "outcome_probabilities": {
+                "0": 1.232595164407831e-32,
+                "1": 1.0
+              }
+            }
+          ],
+          "environment_changes": [
+            {
+              "branch": "",
+              "pattern": "11",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  1,
+                  1
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 20.0,
+                    "elapsed": 20.0,
+                    "correlation": 2.061153622438558e-09,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.04000000032978458
+            },
+            {
+              "branch": "",
+              "pattern": "10",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  1,
+                  0
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 20.0,
+                    "elapsed": 20.0,
+                    "correlation": 2.061153622438558e-09,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.15999999967021541
+            },
+            {
+              "branch": "",
+              "pattern": "01",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  0,
+                  1
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 20.0,
+                    "elapsed": 20.0,
+                    "correlation": 2.061153622438558e-09,
+                    "probability": 0.2,
+                    "state": 1,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.15999999967021544
+            },
+            {
+              "branch": "",
+              "pattern": "00",
+              "environment_states": {
+                "finite-duration-disturbance": [
+                  0,
+                  0
+                ]
+              },
+              "measurement_conditions": {
+                "register": {},
+                "operations": []
+              },
+              "events": {
+                "finite-duration-disturbance": [
+                  {
+                    "site": [
+                      0,
+                      0
+                    ],
+                    "time": 0.0,
+                    "elapsed": null,
+                    "correlation": 1.0,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": null
+                  },
+                  {
+                    "site": [
+                      1,
+                      0
+                    ],
+                    "time": 20.0,
+                    "elapsed": 20.0,
+                    "correlation": 2.061153622438558e-09,
+                    "probability": 0.2,
+                    "state": 0,
+                    "perturbation": null,
+                    "previous_site": [
+                      0,
+                      0
+                    ]
+                  }
+                ]
+              },
+              "timeline": null,
+              "probability": 0.6400000003297847
+            }
+          ],
+          "measurement_conditions": [
+            {
+              "register": {},
+              "operations": []
+            }
+          ],
+          "schedule": {
+            "name": "long-idle",
+            "operation_durations": [
+              0.0,
+              0.0
+            ],
+            "idle_after": [
+              0.0,
+              20.0
+            ]
+          },
+          "timeline": []
+        }
+      ]
+    }
+  }
+}
