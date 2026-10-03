@@ -15,6 +15,7 @@ from .noise import (
     EnvironmentTimeline,
     NoiseModel,
     NoiseRule,
+    SharedEnvironmentGroup,
     TimeSchedule,
 )
 
@@ -66,6 +67,7 @@ def simulate(
 ) -> SimulationResult:
     rules = list(noise_model.rules if noise_model is not None else [])
     groups = list(noise_model.groups if noise_model is not None else [])
+    shared_groups = list(noise_model.shared_groups if noise_model is not None else [])
     if schedule is not None:
         schedule = schedule.normalized(len(circuit.operations))
     timeline = timeline or EnvironmentTimeline()
@@ -73,8 +75,11 @@ def simulate(
         raise ValueError("perturbations require a TimeSchedule to identify physical times")
     _validate_rules(circuit, rules)
     _validate_groups(circuit, groups)
+    _validate_groups(circuit, shared_groups)
+    if groups and shared_groups:
+        raise ValueError("legacy correlated groups and shared environment groups cannot be mixed")
 
-    if not groups:
+    if not groups and not shared_groups:
         state, classical = _evolve(circuit, rules, {}, schedule=schedule, timeline=timeline)
         environment_records = None
         measurement_conditions = None
@@ -106,6 +111,14 @@ def simulate(
         validate_density_matrix(result.state)
         return result
 
+    if shared_groups:
+        combined = _combined_shared_branch_trajectories(
+            circuit, shared_groups, schedule, timeline
+        )
+    else:
+        combined = _combined_branch_trajectories(
+            circuit, groups, schedule, timeline
+        )
     # Exact mixture over the joint correlated-noise trajectories.  Each
     # trajectory applies its error pattern deterministically; the final state
     # is the probability-weighted sum, so correlations are never replaced by
@@ -118,7 +131,6 @@ def simulate(
     measurement_conditions = tuple(
         _measurement_conditions(circuit, register) for register in registers
     )
-    combined = _combined_branch_trajectories(circuit, groups, schedule, timeline)
     size = 2**circuit.num_qubits
     state = zeros(size, size)
     classical_total: dict[str, float] = {}
@@ -133,18 +145,27 @@ def simulate(
             timeline=timeline,
             only_branch=branch,
         )
+        branch_trace = trace(branch_state).real
+        joint_weight = weight * branch_trace if shared_groups else weight
+        state_weight = joint_weight if shared_groups else weight
         for row in range(size):
             for col in range(size):
-                state[row][col] += weight * branch_state[row][col]
+                state[row][col] += (
+                    state_weight * branch_state[row][col] / branch_trace
+                    if shared_groups and branch_trace > 1e-15
+                    else state_weight * branch_state[row][col]
+                )
         for key, value in classical.items():
-            classical_total[key] = classical_total.get(key, 0.0) + weight * value
+            state_value = joint_weight if shared_groups else weight
+            classical_value = value / branch_trace if shared_groups and branch_trace > 1e-15 else value
+            classical_total[key] = classical_total.get(key, 0.0) + state_value * classical_value
         record_with_probability = dict(record)
-        record_with_probability["probability"] = weight
+        record_with_probability["probability"] = joint_weight
         environment_records.append(record_with_probability)
         trajectories.append(
             NoiseTrajectory(
                 label=f"{branch}:{pattern}" if branch else pattern,
-                probability=weight,
+                probability=joint_weight,
                 outcome_probabilities=measurement_probabilities(
                     branch_state, circuit.num_qubits
                 )
@@ -320,6 +341,172 @@ def _combined_branch_trajectories(
                     },
                 )
             )
+    return combined
+
+
+def _shared_experienced_indices(
+    circuit: Circuit,
+    register: tuple[int, ...],
+    groups: Sequence[SharedEnvironmentGroup],
+) -> list[list[int]]:
+    active = set(range(len(circuit.operations)))
+    for index, operation in enumerate(circuit.operations):
+        if operation.condition is not None and not _register_matches(
+            register, operation.condition
+        ):
+            active.discard(index)
+    return [
+        [
+            index
+            for index, (after_gate, _qubit) in enumerate(group.sites)
+            if after_gate in active
+        ]
+        for group in groups
+    ]
+
+
+def _first_measurement_gate(circuit: Circuit) -> Optional[int]:
+    for index, operation in enumerate(circuit.operations):
+        if operation.name == "measure":
+            return index
+    return None
+
+
+def _combined_shared_branch_trajectories(
+    circuit: Circuit,
+    groups: Sequence[SharedEnvironmentGroup],
+    schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
+) -> list[
+    tuple[
+        str,
+        str,
+        float,
+        dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+        dict[str, list[int]],
+        dict[str, object],
+    ]
+]:
+    has_measurement = any(operation.name == "measure" for operation in circuit.operations)
+    if has_measurement and not all(group.continue_across_measurements for group in groups):
+        raise ValueError(
+            "shared environment continuation across a mid-circuit measurement "
+            "must be explicitly enabled; measurement checkpoints cannot silently "
+            "reset the shared environment"
+        )
+    registers = [
+        register
+        for register in _possible_registers(circuit)
+        if _branch_probability(circuit, register, schedule, timeline) > 1e-15
+    ]
+    first_measurement_gate = _first_measurement_gate(circuit)
+    branch_choices: dict[str, list[dict[str, object]]] = {}
+    for branch in registers:
+        branch_key = "".join(str(bit) for bit in branch)
+        experienced = _shared_experienced_indices(circuit, branch, groups)
+        choices_by_group = []
+        for group_index, group in enumerate(groups):
+            event_times = [
+                None if schedule is None else schedule.event_time(after_gate)
+                for after_gate, _qubit in group.sites
+            ]
+            common_probabilities = []
+            for after_gate, _qubit in group.sites:
+                current_time = None if schedule is None else schedule.event_time(after_gate)
+                _perturbation, effective_probability = (
+                    timeline.effective_at(current_time, group.channel)
+                    if current_time is not None
+                    else (None, None)
+                )
+                common_probabilities.append(effective_probability)
+            entries = []
+            for pattern, weight, records in group.trajectories(
+                experienced[group_index],
+                event_times,
+                common_probabilities,
+                timeline,
+            ):
+                prefix_key = tuple(
+                    int(record["common_state"])
+                    for record in records
+                    if first_measurement_gate is None
+                    or record["site"][0] < first_measurement_gate
+                )
+                events = {}
+                for site_index, bit in zip(experienced[group_index], pattern):
+                    if bit:
+                        after_gate, qubit = group.sites[site_index]
+                        events.setdefault(after_gate, []).append(
+                            (group.error_operator, (qubit,))
+                        )
+                entries.append({
+                    "pattern": pattern,
+                    "weight": weight,
+                    "events": events,
+                    "records": records,
+                    "prefix_key": prefix_key,
+                })
+            choices_by_group.append(entries)
+        choices = []
+        for selected in product(*choices_by_group):
+            pattern_parts = []
+            weight = 1.0
+            events = {}
+            states = {}
+            records = {}
+            prefix_key = ()
+            for group, entry in zip(groups, selected):
+                pattern_parts.append("".join(str(bit) for bit in entry["pattern"]))
+                weight *= float(entry["weight"])
+                states[group.name] = list(entry["pattern"])
+                records[group.name] = entry["records"]
+                prefix_key += tuple(entry["prefix_key"])
+                for gate_index, operators in entry["events"].items():
+                    events.setdefault(gate_index, []).extend(operators)
+            choices.append({
+                "pattern": "-".join(pattern_parts),
+                "weight": weight,
+                "events": events,
+                "states": states,
+                "records": records,
+                "prefix_key": prefix_key,
+            })
+        branch_choices[branch_key] = choices
+
+    reference_branch = "".join(str(bit) for bit in registers[0]) if registers else ""
+
+    combined = []
+    for branch_key, choices in branch_choices.items():
+        register = tuple(int(character) for character in branch_key) if branch_key else ()
+        for choice in choices:
+            if has_measurement and branch_key != reference_branch:
+                reference_match = next(
+                    (
+                        candidate
+                        for candidate in branch_choices[reference_branch]
+                        if candidate["prefix_key"] == choice["prefix_key"]
+                    ),
+                    None,
+                )
+                if reference_match is None:
+                    continue
+            events = choice["events"]
+            combined.append((
+                branch_key,
+                f"{branch_key}:{choice['pattern']}" if branch_key else str(choice["pattern"]),
+                float(choice["weight"]),
+                {branch_key: events} if branch_key else events,
+                choice["states"],
+                {
+                    "branch": branch_key,
+                    "pattern": choice["pattern"],
+                    "environment_states": choice["states"],
+                    "measurement_conditions": _measurement_conditions(circuit, register),
+                    "events": choice["records"],
+                    "continues_across_measurements": has_measurement,
+                    "timeline": timeline.change_records() if timeline.perturbations else None,
+                },
+            ))
     return combined
 
 

@@ -21,6 +21,7 @@ from .noise import (
     NoiseModel,
     NoiseRule,
     Perturbation,
+    SharedEnvironmentGroup,
     TimeSchedule,
     direct_perturbed_probabilities,
 )
@@ -67,4 +68,5 @@ __all__ = [
     "start_resumable_batch",
     "simulate",
     "SimulationResult",
+    "SharedEnvironmentGroup",
 ]

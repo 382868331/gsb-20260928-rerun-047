@@ -458,10 +458,237 @@ class CorrelatedNoiseGroup:
 
 
 @dataclass(frozen=True)
+class SharedEnvironmentGroup:
+    """Shared and qubit-specific Pauli errors at physical environment events.
+
+    Sites at exactly the same schedule time consume one common environmental
+    draw. Distinct event times are linked by a persistent common process with
+    adjacent-event Pearson correlation common_correlation; every site also has
+    an independent draw. The causes are explicit, so changing their attribution
+    never silently retunes the marginal error probability.
+    """
+
+    channel: str
+    sites: tuple[tuple[int, int], ...] = ()
+    common_probability: float = 0.0
+    independent_probability: float = 0.0
+    common_correlation: float = 0.0
+    name: str = "shared-environment"
+    correlation_time: float = inf
+    continue_across_measurements: bool = False
+
+    def __post_init__(self) -> None:
+        if self.channel not in _CORRELATED_ERROR_OPERATORS:
+            raise ValueError(
+                "shared environment groups support "
+                f"{sorted(_CORRELATED_ERROR_OPERATORS)}, not {self.channel!r}"
+            )
+        _probability(self.common_probability, "common environment probability")
+        _probability(self.independent_probability, "independent probability")
+        if len(self.sites) < 2:
+            raise ValueError("a shared environment group needs at least two sites")
+        if len(set(self.sites)) != len(self.sites):
+            raise ValueError("shared environment group sites must be distinct")
+        if not 0.0 <= self.common_correlation <= 1.0:
+            raise ValueError("common_correlation must be in [0, 1]")
+        if self.correlation_time <= 0.0:
+            raise ValueError("correlation_time must be positive")
+
+    @property
+    def error_operator(self) -> Matrix:
+        return _CORRELATED_ERROR_OPERATORS[self.channel]
+
+    @property
+    def marginal_probability(self) -> float:
+        return (
+            self.common_probability
+            + self.independent_probability
+            - self.common_probability * self.independent_probability
+        )
+
+    def event_episodes(
+        self, event_times: Sequence[Optional[float]]
+    ) -> tuple[tuple[int, ...], ...]:
+        """Group experienced site indices that see the same physical event."""
+        episodes: list[tuple[int, ...]] = []
+        for site_index, event_time in enumerate(event_times):
+            matched = False
+            for episode_index, episode in enumerate(episodes):
+                if event_time is not None and event_times[episode[0]] == event_time:
+                    episodes[episode_index] = episode + (site_index,)
+                    matched = True
+                    break
+            if not matched:
+                episodes.append((site_index,))
+        return tuple(episodes)
+
+    def trajectories(
+        self,
+        experienced_site_indices: Optional[Sequence[int]] = None,
+        event_times: Optional[Sequence[Optional[float]]] = None,
+        common_probabilities: Optional[Sequence[Optional[float]]] = None,
+        timeline: Optional["EnvironmentTimeline"] = None,
+    ) -> list[tuple[tuple[int, ...], float, list[dict[str, object]]]]:
+        """Enumerate site errors from common and independent causes exactly."""
+        site_indices = list(
+            range(len(self.sites)) if experienced_site_indices is None
+            else experienced_site_indices
+        )
+        if event_times is None:
+            experienced_times: list[Optional[float]] = [None] * len(site_indices)
+        else:
+            if len(event_times) != len(self.sites):
+                raise ValueError("one event time is required for every declared site")
+            experienced_times = [event_times[index] for index in site_indices]
+        if common_probabilities is None:
+            experienced_common_probabilities: list[Optional[float]] = [None] * len(site_indices)
+        else:
+            if len(common_probabilities) != len(self.sites):
+                raise ValueError("one common probability is required for every declared site")
+            experienced_common_probabilities = [
+                common_probabilities[index] for index in site_indices
+            ]
+        episodes = self.event_episodes(experienced_times)
+        def enumerate_common(
+            episode_index: int,
+            weight: float,
+            records: list[dict[str, object]],
+            common_values: tuple[int, ...] = (),
+        ) -> list[tuple[tuple[int, ...], float, list[dict[str, object]]]]:
+            if episode_index == len(episodes):
+                return [(common_values, weight, records)]
+            episode = episodes[episode_index]
+            previous_episode = episodes[episode_index - 1] if episode_index else None
+            correlation = 0.0
+            elapsed: Optional[float] = None
+            if previous_episode is not None:
+                current_time = experienced_times[episode[0]]
+                previous_time = experienced_times[previous_episode[0]]
+                if current_time is not None and previous_time is not None:
+                    elapsed = current_time - previous_time
+                    if elapsed < 0.0:
+                        raise ValueError("elapsed time must be nonnegative")
+                    if timeline is not None:
+                        correlation = timeline.correlation_over(
+                            self.common_correlation,
+                            previous_time,
+                            current_time,
+                            self.correlation_time,
+                            self.channel,
+                        )
+                    else:
+                        decay = (
+                            0.0
+                            if self.correlation_time == inf
+                            else elapsed / self.correlation_time
+                        )
+                        correlation = self.common_correlation * exp(-decay)
+            episode_probabilities = [
+                experienced_common_probabilities[site_position]
+                for site_position in episode
+            ]
+            effective_probabilities = {
+                value for value in episode_probabilities if value is not None
+            }
+            if len(effective_probabilities) > 1:
+                raise ValueError("sites sharing one environmental event must share its probability")
+            probability = (
+                self.common_probability
+                if not effective_probabilities
+                else float(next(iter(effective_probabilities)))
+            )
+            completed = []
+            for bit in (1, 0):
+                if episode_index == 0:
+                    transition = probability if bit else 1.0 - probability
+                else:
+                    previous_bit = common_values[episode_index - 1]
+                    stay_error = probability + correlation * (1.0 - probability)
+                    become_error = probability * (1.0 - correlation)
+                    conditional = stay_error if previous_bit else become_error
+                    transition = conditional if bit else 1.0 - conditional
+                episode_records = list(records)
+                for site_position in episode:
+                    episode_records.append({
+                        "site": list(self.sites[site_indices[site_position]]),
+                        "time": experienced_times[site_position],
+                        "elapsed": elapsed,
+                        "common_correlation": correlation,
+                        "common_probability": probability,
+                        "independent_probability": self.independent_probability,
+                        "common_state": bit,
+                        "cause": "shared-environment",
+                    })
+                completed.extend(
+                    enumerate_common(
+                        episode_index + 1,
+                        weight * transition,
+                        episode_records,
+                        common_values + (bit,),
+                    )
+                )
+            return completed
+
+        results = []
+        for common_pattern, common_weight, records in enumerate_common(0, 1.0, []):
+            site_common_bits = [0] * len(site_indices)
+            for episode_index, episode in enumerate(episodes):
+                for site_position in episode:
+                    site_common_bits[site_position] = common_pattern[episode_index]
+            patterns = [(tuple(), common_weight)]
+            for common_bit in site_common_bits:
+                next_patterns = []
+                for pattern, old_weight in patterns:
+                    if common_bit:
+                        next_patterns.append((pattern + (1,), old_weight))
+                    else:
+                        for bit in (1, 0):
+                            conditional = (
+                                self.independent_probability
+                                if bit
+                                else 1.0 - self.independent_probability
+                            )
+                            next_patterns.append((pattern + (bit,), old_weight * conditional))
+                patterns = next_patterns
+            for pattern, weight in patterns:
+                if weight > 0.0:
+                    results.append((pattern, weight, records))
+        return results
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "channel": self.channel,
+            "sites": [list(site) for site in self.sites],
+            "common_probability": self.common_probability,
+            "independent_probability": self.independent_probability,
+            "common_correlation": self.common_correlation,
+            "correlation_time": None if self.correlation_time == inf else self.correlation_time,
+            "continue_across_measurements": self.continue_across_measurements,
+        }
+
+    @staticmethod
+    def from_dict(data: dict) -> "SharedEnvironmentGroup":
+        return SharedEnvironmentGroup(
+            channel=data["channel"],
+            sites=tuple(tuple(site) for site in data["sites"]),
+            common_probability=float(data.get("common_probability", 0.0)),
+            independent_probability=float(data.get("independent_probability", 0.0)),
+            common_correlation=float(data.get("common_correlation", 0.0)),
+            name=data.get("name", "shared-environment"),
+            correlation_time=float(data.get("correlation_time", inf))
+            if data.get("correlation_time") is not None
+            else inf,
+            continue_across_measurements=bool(data.get("continue_across_measurements", False)),
+        )
+
+
+@dataclass(frozen=True)
 class NoiseModel:
     name: str
     rules: Sequence[NoiseRule] = field(default_factory=tuple)
     groups: Sequence[CorrelatedNoiseGroup] = field(default_factory=tuple)
+    shared_groups: Sequence[SharedEnvironmentGroup] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -477,6 +704,7 @@ class NoiseModel:
                 for rule in self.rules
             ],
             "groups": [group.to_dict() for group in self.groups],
+            "shared_groups": [group.to_dict() for group in self.shared_groups],
         }
 
     @staticmethod
@@ -496,5 +724,9 @@ class NoiseModel:
             groups=tuple(
                 CorrelatedNoiseGroup.from_dict(item)
                 for item in data.get("groups", [])
+            ),
+            shared_groups=tuple(
+                SharedEnvironmentGroup.from_dict(item)
+                for item in data.get("shared_groups", [])
             ),
         )

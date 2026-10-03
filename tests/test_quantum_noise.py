@@ -17,13 +17,14 @@ from quantum_noise.experiments import (
     save_schedule_comparison,
     start_resumable_batch,
 )
-from quantum_noise.gates import Circuit, X, Z, bell_circuit
+from quantum_noise.gates import Circuit, I, X, Z, bell_circuit
 from quantum_noise.noise import (
     CorrelatedNoiseGroup,
     EnvironmentTimeline,
     NoiseModel,
     NoiseRule,
     Perturbation,
+    SharedEnvironmentGroup,
     TimeSchedule,
     direct_perturbed_probabilities,
 )
@@ -198,6 +199,142 @@ class CorrelatedNoiseTests(unittest.TestCase):
             )
 
 
+class SharedEnvironmentTests(unittest.TestCase):
+    def short_parallel_circuit(self):
+        return Circuit(2).apply("i", I, 0).apply("i", I, 1)
+
+    def group(self, common_probability, independent_probability, correlation=0.0):
+        return SharedEnvironmentGroup(
+            channel="bit_flip",
+            sites=((0, 0), (0, 1)),
+            common_probability=common_probability,
+            independent_probability=independent_probability,
+            common_correlation=correlation,
+        )
+
+    def simulate_group(self, group, schedule=None, timeline=None):
+        return simulate(
+            self.short_parallel_circuit(),
+            NoiseModel("shared", (), (), (group,)),
+            schedule,
+            timeline,
+        )
+
+    def test_overlapping_sites_share_one_common_draw(self):
+        schedule = TimeSchedule((0.0, 0.0), (0.0, 0.0), "overlap")
+        result = self.simulate_group(self.group(0.25, 0.0), schedule)
+        self.assertAlmostEqual(result.probabilities["11"], 0.25)
+        self.assertAlmostEqual(result.probabilities["00"], 0.75)
+        self.assertAlmostEqual(result.probabilities["01"], 0.0)
+        self.assertAlmostEqual(result.probabilities["10"], 0.0)
+
+    def test_independent_only_has_full_joint_distribution(self):
+        schedule = TimeSchedule((0.0, 0.0), (0.0, 0.0), "overlap")
+        result = self.simulate_group(self.group(0.0, 0.25), schedule)
+        self.assertAlmostEqual(result.probabilities["00"], 0.75**2)
+        self.assertAlmostEqual(result.probabilities["11"], 0.25**2)
+        self.assertAlmostEqual(result.probabilities["01"], 0.25 * 0.75)
+        self.assertAlmostEqual(result.probabilities["10"], 0.25 * 0.75)
+
+    def test_common_plus_independent_preserves_explicit_attribution(self):
+        schedule = TimeSchedule((0.0, 0.0), (0.0, 0.0), "overlap")
+        common_probability, independent_probability = 0.2, 0.1
+        result = self.simulate_group(
+            self.group(common_probability, independent_probability), schedule
+        )
+        a, b = common_probability, independent_probability
+        self.assertAlmostEqual(
+            result.probabilities["11"],
+            a + (1.0 - a) * b**2,
+        )
+        self.assertAlmostEqual(result.probabilities["00"], (1.0 - a) * (1.0 - b) ** 2)
+        one_error = (1.0 - a) * b * (1.0 - b)
+        self.assertAlmostEqual(result.probabilities["01"], one_error)
+        self.assertAlmostEqual(result.probabilities["10"], one_error)
+
+    def test_nonoverlapping_times_remove_finite_duration_common_effect(self):
+        circuit = Circuit(2).apply("i", I, 0).apply("i", I, 1)
+        schedule = TimeSchedule((0.0, 0.0), (0.0, 20.0), "timing")
+        group = SharedEnvironmentGroup(
+            "bit_flip",
+            ((0, 0), (1, 1)),
+            common_probability=0.25,
+            independent_probability=0.0,
+            common_correlation=1.0,
+            correlation_time=1.0,
+        )
+        overlap_group = SharedEnvironmentGroup(
+            "bit_flip",
+            ((0, 0), (0, 1)),
+            common_probability=0.25,
+            independent_probability=0.0,
+            common_correlation=1.0,
+            correlation_time=1.0,
+        )
+        overlap_result = simulate(
+            circuit, NoiseModel("shared", (), (), (overlap_group,)), schedule
+        )
+        separated_result = simulate(
+            circuit, NoiseModel("shared", (), (), (group,)), schedule
+        )
+        self.assertAlmostEqual(overlap_result.probabilities["11"], 0.25)
+        self.assertAlmostEqual(overlap_result.probabilities["01"], 0.0)
+        self.assertAlmostEqual(separated_result.probabilities["00"], 0.75**2)
+        self.assertAlmostEqual(separated_result.probabilities["11"], 0.25**2)
+        self.assertAlmostEqual(separated_result.probabilities["01"], 0.25 * 0.75, places=6)
+        self.assertAlmostEqual(separated_result.probabilities["10"], 0.25 * 0.75, places=6)
+
+    def test_perturbation_changes_the_single_shared_event(self):
+        schedule = TimeSchedule((0.0, 0.0), (0.0, 0.0), "overlap")
+        timeline = EnvironmentTimeline((Perturbation(0.0, 1.0, 0.5, name="pulse"),))
+        result = self.simulate_group(self.group(0.0, 0.0), schedule, timeline)
+        self.assertAlmostEqual(result.probabilities["00"], 0.5)
+        self.assertAlmostEqual(result.probabilities["11"], 0.5)
+        self.assertAlmostEqual(result.probabilities["01"], 0.0)
+        self.assertAlmostEqual(result.probabilities["10"], 0.0)
+
+    def test_invalid_attribution_is_rejected(self):
+        with self.assertRaises(ValueError):
+            SharedEnvironmentGroup("bit_flip", ((0, 0),), common_probability=0.2)
+        with self.assertRaises(ValueError):
+            self.group(0.2, 0.2, correlation=1.5)
+
+    def test_mid_circuit_measurement_requires_explicit_continuation(self):
+        circuit = Circuit(1).h(0).measure(0, 0)
+        group = SharedEnvironmentGroup(
+            "bit_flip",
+            ((0, 0), (1, 0)),
+            common_probability=0.2,
+        )
+        with self.assertRaises(ValueError):
+            simulate(circuit, NoiseModel("shared", (), (), (group,)))
+
+    def test_explicit_measurement_continuation_keeps_prefix_environment(self):
+        circuit = Circuit(1).h(0).measure(0, 0).apply("i", I, 0)
+        group = SharedEnvironmentGroup(
+            "bit_flip",
+            ((0, 0), (2, 0)),
+            common_probability=0.25,
+            common_correlation=1.0,
+            continue_across_measurements=True,
+        )
+        result = simulate(circuit, NoiseModel("shared", (), (), (group,)))
+        weights = [trajectory.probability for trajectory in result.noise_trajectories]
+        self.assertAlmostEqual(sum(weights), 1.0)
+        branch_records = {}
+        for record in result.environment_records:
+            branch_records[record["branch"]] = record
+        prefix_by_branch = {
+            branch: [
+                event["common_state"]
+                for event in record["events"]["shared-environment"]
+                if event["site"][0] == 0
+            ]
+            for branch, record in branch_records.items()
+        }
+        self.assertEqual(prefix_by_branch["0"], prefix_by_branch["1"])
+
+
 class MidCircuitMeasurementTests(unittest.TestCase):
     def test_conditional_gate_direct_computation(self):
         # H, measure, X conditioned on outcome 0: every branch ends in |1>.
@@ -316,6 +453,34 @@ class CorrelatedBatchTests(unittest.TestCase):
             self.assertEqual(len(saved_runs), 1)
             reproduced = rerun_archive(path)
             self.assertEqual(runs[0].noisy_counts, reproduced[0].noisy_counts)
+
+    def test_shared_environment_archive_round_trip(self):
+        circuit = Circuit(2).apply("i", I, 0).apply("i", I, 1)
+        group = SharedEnvironmentGroup(
+            channel="bit_flip",
+            sites=((0, 0), (0, 1)),
+            common_probability=0.2,
+            independent_probability=0.1,
+            common_correlation=1.0,
+            correlation_time=1.0,
+        )
+        batch = ExperimentBatch(
+            circuit=circuit,
+            noise_model=NoiseModel("shared", (), (), (group,)),
+            shots=256,
+            base_seed=909,
+            name="shared-env",
+            schedule=TimeSchedule((0.0, 0.0), (0.0, 0.0), "overlap"),
+        )
+        runs = run_batch(batch, repeats=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "shared.json"
+            save_batch_archive(path, batch, runs)
+            reproduced = rerun_archive(path)
+        self.assertEqual(
+            [run.noisy_counts for run in runs],
+            [run.noisy_counts for run in reproduced],
+        )
 
 
 class TimeScheduleTests(unittest.TestCase):

@@ -9,6 +9,8 @@
  - 顺序有效：`NoiseRule(after_gate=...)` 按线路门索引插入；同一位置的多条规则按列表顺序执行。
 - 时间相关噪声：`CorrelatedNoiseGroup` 用两态马尔可夫链耦合多个线路位置的错误事件，相关强度 `correlation` 从 0（独立）到 1（完全相关）；联合噪声轨迹被精确枚举并加权混合，绝不用独立重复抽样代替相关过程。
 - 中途测量与条件操作：`Circuit.measure(qubit, cbit)` 在经典寄存器上分裂分支，`Circuit.apply(..., condition=(cbit, value))` 只在匹配分支上作用。
+- 共享环境噪声：`SharedEnvironmentGroup` 将同一物理时刻作用于多个量子位的事件绑定为一次共同环境抽取；共同原因与量子位独有原因分别由 `common_probability` 和 `independent_probability` 指定，跨时间持续性由 `common_correlation` 与 `correlation_time` 控制。
+- 显式测量续接：共享环境组默认拒绝跨中途测量继续；只有设置 `continue_across_measurements=True` 才保留测量前共同环境经历，未确认时不会在测量或检查点恢复时悄悄重置。
 - 随机性可追溯：相关噪声批次中，每个 shot 先按 `noise_seed` 抽噪声轨迹、再按 `measure_seed` 抽测量结果，两种随机性分开追溯、分别可复现；运行结果记录噪声轨迹分布。
 - 时间安排与持续扰动：`TimeSchedule` 为每个操作和随后的空闲区间指定时间；相关组使用有限 `correlation_time`，相关随两次环境事件的实际间隔指数衰减。
 - 分支独立环境：中途测量后的每个经典分支单独延续环境状态；条件门被跳过时，不会只因为分支操作数量相同就共享扰动历史。
@@ -26,6 +28,7 @@ python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
 python examples/perturbation_timing_comparison.py
+python examples/shared_environment_comparison.py
 ```
 
 命令行示例：
@@ -65,6 +68,12 @@ batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 2026100
 `ExperimentPrefix.fork(name, perturbations)` 从同一前缀派生不同扰动时刻的独立批次，并保留锚点之前已发生的扰动；尝试把新扰动写到锚点之前会报错。`ExperimentBatch.with_perturbations(...)` 用于没有共同历史约束的直接派生。暂停恢复可使用 `start_resumable_batch(..., pause_at_perturbation=(name, phase))`，阶段为 `start`、`overlap` 或 `end`；恢复时重放原批次，采样结果与直接执行及改变检查点执行顺序一致。`direct_perturbed_probabilities` 提供无扰动、持续扰动和半开区间瞬时边界的短线路直接对照。
 
 ## 最小代码示例
+### 共同环境联合结果
+
+`SharedEnvironmentGroup` 使用 `TimeSchedule` 的实际事件时间分组：同一时间的多个位点共享一个共同伯努利变量，不同时间按 `common_correlation * exp(-elapsed / correlation_time)` 延续。每个位点还可单独经历 `independent_probability`，最终错误是共同项与独立项的显式 OR；模拟器枚举完整联合轨迹，因此比较保留 `00/01/10/11` 等联合结果。
+
+短线路 `examples/shared_environment_comparison.py` 核对无共同影响、完全共同变化、共同加独立成分三个重叠时间边界，再用 20 个相关时间单位的非重叠安排检查持续性消失。无效相关强度、持续时间、位点配置会直接报错；未设置 `continue_across_measurements=True` 时，跨中途测量的共享环境实验也会被拒绝，避免把续接错解释成重置。
+
 
 ```python
 from quantum_noise import Circuit, ExperimentBatch, NoiseModel, NoiseRule, run_batch

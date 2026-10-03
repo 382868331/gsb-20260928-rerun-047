@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
-from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
+from .gates import Circuit, CNOT, CZ, H, I, S, SWAP, X, Y, Z, rx, ry, rz
 from .noise import EnvironmentTimeline, NoiseModel, Perturbation, TimeSchedule
 from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
@@ -174,7 +174,7 @@ def run_batch(
     ideal_result, noisy_result = compare_ideal_and_noisy(
         batch.circuit, batch.noise_model, schedule, batch.normalized_timeline
     )
-    correlated = bool(batch.noise_model.groups)
+    correlated = bool(batch.noise_model.groups or batch.noise_model.shared_groups)
     trajectory_records = None
     if correlated:
         trajectory_records = [
@@ -682,6 +682,7 @@ def _operation_kind_and_angle(name: str) -> tuple[str, Optional[float]]:
 def _gate_matrix(name: str, angle: Optional[float]) -> Any:
     table = {
         "h": H,
+        "i": I,
         "x": X,
         "y": Y,
         "z": Z,
