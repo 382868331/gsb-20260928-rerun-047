@@ -6,6 +6,7 @@ from .experiments import (
     ExperimentBatch,
     ExperimentTask,
     ExperimentPrefix,
+    MeasurementStudy,
     ResumableBatch,
     compare_schedules,
     resume_batch,
@@ -14,6 +15,7 @@ from .experiments import (
     save_schedule_comparison,
     start_resumable_batch,
 )
+from .environment import EnvironmentEvent, EventCancellation, firing_plan
 from .gates import Circuit, bell_circuit, ghz_circuit
 from .noise import (
     CorrelatedNoiseGroup,
@@ -41,6 +43,7 @@ __all__ = [
     "DifferenceTest",
     "ExperimentBatch",
     "ExperimentPrefix",
+    "MeasurementStudy",
     "NoiseModel",
     "NoiseRule",
     "Perturbation",
@@ -51,6 +54,9 @@ __all__ = [
     "TimeSchedule",
     "BatchCheckpoint",
     "ExperimentTask",
+    "EnvironmentEvent",
+    "EventCancellation",
+    "firing_plan",
     "ResumableBatch",
     "compare_schedules",
     "resume_batch",

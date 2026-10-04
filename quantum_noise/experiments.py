@@ -12,11 +12,12 @@ from typing import Any, Optional, Sequence
 
 from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
 from .noise import EnvironmentTimeline, NoiseModel, Perturbation, TimeSchedule
+from .environment import EnvironmentEvent, EventCancellation
 from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
 
 
-ARCHIVE_SCHEMA_VERSION = 4
+ARCHIVE_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,8 @@ class ExperimentBatch:
     name: str = "experiment"
     schedule: Optional[TimeSchedule] = None
     timeline: Optional[EnvironmentTimeline] = None
+    environment_events: tuple[EnvironmentEvent, ...] = ()
+    event_cancellations: tuple[EventCancellation, ...] = ()
 
     def seeds(self, repeats: int) -> list[int]:
         if repeats <= 0:
@@ -51,6 +54,11 @@ class ExperimentBatch:
             raise ValueError("perturbations require a schedule")
         return self.timeline
 
+    def normalized_environment_events(self) -> tuple[EnvironmentEvent, ...]:
+        if self.environment_events and self.schedule is None:
+            raise ValueError("environment events require a schedule")
+        return tuple(self.environment_events)
+
     def with_perturbations(
         self,
         perturbations: Sequence[Perturbation],
@@ -65,6 +73,25 @@ class ExperimentBatch:
             name=name or self.name,
             schedule=self.schedule,
             timeline=EnvironmentTimeline(tuple(perturbations)),
+        )
+
+    def with_environment_events(
+        self,
+        events: Sequence[EnvironmentEvent],
+        name: Optional[str] = None,
+        cancellations: Sequence[EventCancellation] = (),
+    ) -> "ExperimentBatch":
+        """Derive an independent study with its own finite-duration events."""
+        return ExperimentBatch(
+            circuit=self.circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=name or self.name,
+            schedule=self.schedule,
+            timeline=self.timeline,
+            environment_events=tuple(events),
+            event_cancellations=tuple(cancellations),
         )
 
 
@@ -127,6 +154,9 @@ class BatchRun:
     measurement_conditions: Optional[list[dict[str, Any]]] = None
     schedule: Optional[TimeSchedule] = None
     timeline: Optional[EnvironmentTimeline] = None
+    environment_events: Optional[list[EnvironmentEvent]] = None
+    event_cancellations: Optional[list[EventCancellation]] = None
+    environment_event_realizations: Optional[list[dict[str, Any]]] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -160,6 +190,13 @@ class BatchRun:
             "measurement_conditions": self.measurement_conditions,
             "schedule": self.schedule.to_dict() if self.schedule is not None else None,
             "timeline": self.timeline.to_list() if self.timeline is not None else None,
+            "environment_events": [
+                event.to_dict() for event in self.environment_events
+            ] if self.environment_events else [],
+            "event_cancellations": [
+                cancellation.to_dict() for cancellation in self.event_cancellations
+            ] if self.event_cancellations else [],
+            "environment_event_realizations": self.environment_event_realizations,
         }
 
 
@@ -171,10 +208,16 @@ def run_batch(
         if batch.schedule is not None
         else None
     )
+    environment_events = batch.normalized_environment_events()
     ideal_result, noisy_result = compare_ideal_and_noisy(
-        batch.circuit, batch.noise_model, schedule, batch.normalized_timeline
+        batch.circuit,
+        batch.noise_model,
+        schedule,
+        batch.normalized_timeline,
+        environment_events=environment_events,
+        event_cancellations=batch.event_cancellations,
     )
-    correlated = bool(batch.noise_model.groups)
+    correlated = bool(batch.noise_model.groups) or bool(environment_events)
     trajectory_records = None
     if correlated:
         trajectory_records = [
@@ -187,10 +230,22 @@ def run_batch(
         ]
     environment_changes = None
     measurement_conditions = None
+    environment_event_records = None
     if noisy_result.environment_records is not None:
         environment_changes = [dict(record) for record in noisy_result.environment_records]
     if noisy_result.measurement_conditions is not None:
         measurement_conditions = [dict(record) for record in noisy_result.measurement_conditions]
+    if environment_events:
+        environment_event_records = [
+            {
+                "event": event.to_dict(),
+                "realizations": [
+                    {"bits": list(bits), "probability": weight}
+                    for bits, weight in event.realizations()
+                ],
+            }
+            for event in environment_events
+        ]
     runs: list[BatchRun] = []
     for index, seed in enumerate(batch.seeds(repeats)):
         ideal_rng_seed = _derive_seed(seed, b"ideal")
@@ -242,6 +297,9 @@ def run_batch(
                 measurement_conditions=measurement_conditions,
                 schedule=schedule,
                 timeline=batch.normalized_timeline,
+                environment_events=list(environment_events),
+                event_cancellations=list(batch.event_cancellations),
+                environment_event_realizations=environment_event_records,
             )
         )
     return runs
@@ -267,6 +325,12 @@ def save_batch_archive(
             "noise_model": batch.noise_model.to_dict(),
             "schedule": batch.schedule.to_dict() if batch.schedule is not None else None,
             "timeline": batch.normalized_timeline.to_list(),
+            "environment_events": [
+                event.to_dict() for event in batch.normalized_environment_events()
+            ],
+            "event_cancellations": [
+                cancellation.to_dict() for cancellation in batch.event_cancellations
+            ],
         },
         "runs": [run.to_dict() for run in runs],
     }
@@ -275,7 +339,7 @@ def save_batch_archive(
 
 def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
-    if payload.get("schema_version") not in (1, 2, ARCHIVE_SCHEMA_VERSION):
+    if payload.get("schema_version") not in (1, 2, 4, ARCHIVE_SCHEMA_VERSION):
         raise ValueError("unsupported batch archive schema")
     data = payload["batch"]
     batch = ExperimentBatch(
@@ -288,6 +352,13 @@ def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]
         if data.get("schedule") is not None
         else None,
         timeline=EnvironmentTimeline.from_list(data.get("timeline")),
+        environment_events=tuple(
+            EnvironmentEvent.from_dict(item) for item in data.get("environment_events", ())
+        ),
+        event_cancellations=tuple(
+            EventCancellation.from_dict(item)
+            for item in data.get("event_cancellations", ())
+        ),
     )
     return batch, payload["runs"]
 
@@ -374,6 +445,12 @@ def _batch_payload(batch: ExperimentBatch) -> dict[str, Any]:
         if batch.normalized_schedule is not None
         else None,
         "timeline": batch.normalized_timeline.to_list(),
+        "environment_events": [
+            event.to_dict() for event in batch.normalized_environment_events()
+        ],
+        "event_cancellations": [
+            cancellation.to_dict() for cancellation in batch.event_cancellations
+        ],
     }
 
 
@@ -478,6 +555,14 @@ class ResumableBatch:
             if batch_data.get("schedule") is not None
             else None,
             timeline=EnvironmentTimeline.from_list(batch_data.get("timeline")),
+            environment_events=tuple(
+                EnvironmentEvent.from_dict(item)
+                for item in batch_data.get("environment_events", ())
+            ),
+            event_cancellations=tuple(
+                EventCancellation.from_dict(item)
+                for item in batch_data.get("event_cancellations", ())
+            ),
         )
         execution = cls(
             path=Path(path),
@@ -560,6 +645,122 @@ def resume_batch(path: str | Path) -> ResumableBatch:
     return ResumableBatch.resume(path)
 
 
+@dataclass(frozen=True)
+class MeasurementStudy:
+    """A study saved at a mid-circuit measurement point.
+
+    The continuation runs the whole circuit (prefix plus suffix), so the
+    saved prefix and the environmental conditions before the measurement
+    remain part of the archived specification and cannot be rewritten by
+    later event changes.
+
+    Two continuations have different meanings:
+
+    * continue_observed keeps one shared realization for every event
+      active around the measurement, so the continuation uses the same
+      environmental conditions already observed in the prefix;
+    * continue_resampled truncates each event at the measurement and
+      starts a fresh, independently drawn event afterward.
+    """
+
+    full_circuit: Circuit
+    noise_model: NoiseModel
+    schedule: TimeSchedule
+    measurement_time: float
+    shots: int
+    base_seed: int
+    name: str = "measurement-study"
+    events: tuple[EnvironmentEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.measurement_time < 0.0:
+            raise ValueError("measurement_time must be nonnegative")
+        if not any(
+            operation.name == "measure" for operation in self.full_circuit.operations
+        ):
+            raise ValueError("a measurement study requires a mid-circuit measurement")
+
+    def _validate_future_events(self, events: Sequence[EnvironmentEvent]) -> None:
+        for event in events:
+            if event.start < self.measurement_time - 1e-12:
+                raise ValueError(
+                    f"event {event.name!r} starts before the saved measurement point; "
+                    "prefix events cannot be rewritten"
+                )
+
+    def continue_observed(
+        self,
+        future_events: Sequence[EnvironmentEvent] = (),
+        name: Optional[str] = None,
+    ) -> ExperimentBatch:
+        """Continue with the environmental conditions already observed."""
+        self._validate_future_events(future_events)
+        return ExperimentBatch(
+            circuit=self.full_circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=name or f"{self.name}-observed",
+            schedule=self.schedule,
+            environment_events=tuple(self.events) + tuple(future_events),
+        )
+
+    def continue_resampled(
+        self,
+        future_events: Sequence[EnvironmentEvent] = (),
+        name: Optional[str] = None,
+    ) -> ExperimentBatch:
+        """Continue with fresh, independently drawn environmental events.
+
+        Prefix events that straddle the measurement are split: the part
+        before the measurement keeps its draw, and a new event with the
+        same parameters is created for the remaining window, so the suffix
+        environment is freshly sampled instead of reusing the observed
+        draw.  Explicitly provided future events remain untouched.
+        """
+        self._validate_future_events(future_events)
+        events: list[EnvironmentEvent] = []
+        for event in self.events:
+            if event.end <= self.measurement_time + 1e-12:
+                events.append(event)
+            elif event.start < self.measurement_time:
+                events.append(
+                    EnvironmentEvent(
+                        start=event.start,
+                        end=self.measurement_time,
+                        qubits=event.qubits,
+                        common_probability=event.common_probability,
+                        independent_probability=event.independent_probability,
+                        channel=event.channel,
+                        name=f"{event.name}:before-measurement",
+                        priority=event.priority,
+                    )
+                )
+                events.append(
+                    EnvironmentEvent(
+                        start=self.measurement_time,
+                        end=event.end,
+                        qubits=event.qubits,
+                        common_probability=event.common_probability,
+                        independent_probability=event.independent_probability,
+                        channel=event.channel,
+                        name=f"{event.name}:resampled-after-measurement",
+                        priority=event.priority,
+                    )
+                )
+        for event in future_events:
+            events.append(event)
+        return ExperimentBatch(
+            circuit=self.full_circuit,
+            noise_model=self.noise_model,
+            shots=self.shots,
+            base_seed=self.base_seed,
+            name=name or f"{self.name}-resampled",
+            schedule=self.schedule,
+            environment_events=tuple(events),
+        )
+
+
 def _batch_run_from_dict(data: dict[str, Any]) -> BatchRun:
     tests = {
         outcome: DifferenceTest(
@@ -623,6 +824,15 @@ def _batch_run_from_dict(data: dict[str, Any]) -> BatchRun:
         if data.get("schedule") is not None
         else None,
         timeline=EnvironmentTimeline.from_list(data.get("timeline")),
+        environment_events=[
+            EnvironmentEvent.from_dict(item)
+            for item in data.get("environment_events", ())
+        ],
+        event_cancellations=[
+            EventCancellation.from_dict(item)
+            for item in data.get("event_cancellations", ())
+        ],
+        environment_event_realizations=data.get("environment_event_realizations"),
     )
 
 

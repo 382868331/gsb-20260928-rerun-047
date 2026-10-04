@@ -17,6 +17,12 @@ from .noise import (
     NoiseRule,
     TimeSchedule,
 )
+from .environment import (
+    EnvironmentEvent,
+    EventCancellation,
+    event_joint_probabilities,
+    firing_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -63,18 +69,29 @@ def simulate(
     noise_model: Optional[NoiseModel] = None,
     schedule: Optional[TimeSchedule] = None,
     timeline: Optional[EnvironmentTimeline] = None,
+    environment_events: Optional[Sequence[EnvironmentEvent]] = None,
+    event_cancellations: Optional[Sequence[EventCancellation]] = None,
 ) -> SimulationResult:
     rules = list(noise_model.rules if noise_model is not None else [])
     groups = list(noise_model.groups if noise_model is not None else [])
+    environment_events = tuple(environment_events or ())
+    event_cancellations = tuple(event_cancellations or ())
     if schedule is not None:
         schedule = schedule.normalized(len(circuit.operations))
     timeline = timeline or EnvironmentTimeline()
     if timeline.perturbations and schedule is None:
         raise ValueError("perturbations require a TimeSchedule to identify physical times")
+    if environment_events and schedule is None:
+        raise ValueError("environment events require a TimeSchedule to identify physical times")
+    _validate_events(circuit, environment_events)
+    cancellation_names = {event.name for event in environment_events}
+    for cancellation in event_cancellations:
+        if cancellation.event_name not in cancellation_names:
+            raise ValueError(f"cancellation targets unknown event {cancellation.event_name!r}")
     _validate_rules(circuit, rules)
     _validate_groups(circuit, groups)
 
-    if not groups:
+    if not groups and not environment_events:
         state, classical = _evolve(circuit, rules, {}, schedule=schedule, timeline=timeline)
         environment_records = None
         measurement_conditions = None
@@ -106,54 +123,101 @@ def simulate(
         validate_density_matrix(result.state)
         return result
 
-    # Exact mixture over the joint correlated-noise trajectories.  Each
-    # trajectory applies its error pattern deterministically; the final state
-    # is the probability-weighted sum, so correlations are never replaced by
-    # independent per-site sampling.
-    registers = [
-        register
-        for register in _possible_registers(circuit)
-        if _branch_probability(circuit, register, schedule, timeline) > 1e-15
-    ]
+    # Exact mixture over joint correlated-noise and common-environment
+    # trajectories.  An environment event is drawn once for the whole
+    # circuit, so pre-measurement firings are shared across the classical
+    # branches splitting off afterward (never re-applied per branch).
+    registers = list(_possible_registers(circuit))
     measurement_conditions = tuple(
         _measurement_conditions(circuit, register) for register in registers
     )
-    combined = _combined_branch_trajectories(circuit, groups, schedule, timeline)
     size = 2**circuit.num_qubits
     state = zeros(size, size)
     classical_total: dict[str, float] = {}
     trajectories: list[NoiseTrajectory] = []
     environment_records: list[dict[str, object]] = []
-    for branch, pattern, weight, events, environment_states, record in combined:
-        branch_state, classical = _evolve(
-            circuit,
-            rules,
-            {branch: events},
-            schedule=schedule,
-            timeline=timeline,
-            only_branch=branch,
+    if environment_events:
+        measurement_indices = [
+            index
+            for index, operation in enumerate(circuit.operations)
+            if operation.name == "measure"
+        ]
+        plan = firing_plan(
+            environment_events,
+            schedule,
+            event_cancellations,
+            measurement_indices,
         )
-        for row in range(size):
-            for col in range(size):
-                state[row][col] += weight * branch_state[row][col]
-        for key, value in classical.items():
-            classical_total[key] = classical_total.get(key, 0.0) + weight * value
-        record_with_probability = dict(record)
-        record_with_probability["probability"] = weight
-        environment_records.append(record_with_probability)
-        trajectories.append(
-            NoiseTrajectory(
-                label=f"{branch}:{pattern}" if branch else pattern,
-                probability=weight,
-                outcome_probabilities=measurement_probabilities(
-                    branch_state, circuit.num_qubits
-                )
-                if trace(branch_state).real > 1e-15
-                else {},
-                branch=branch,
-                environment_states=environment_states,
+        trajectory_entries = _event_trajectory_entries(
+            circuit, groups, environment_events, plan, schedule, timeline
+        )
+        for pattern, weight, events, environment_states, records in trajectory_entries:
+            evolved, classical = _evolve(
+                circuit, rules, events, schedule=schedule, timeline=timeline
             )
+            for row in range(size):
+                for col in range(size):
+                    state[row][col] += weight * evolved[row][col]
+            for key, value in classical.items():
+                classical_total[key] = classical_total.get(key, 0.0) + weight * value
+            environment_records.append(
+                {
+                    "pattern": pattern,
+                    "probability": weight,
+                    "environment_states": environment_states,
+                    "events": records,
+                    "timeline": timeline.change_records()
+                    if timeline.perturbations
+                    else None,
+                }
+            )
+            trajectories.append(
+                NoiseTrajectory(
+                    label=pattern,
+                    probability=weight,
+                    outcome_probabilities=measurement_probabilities(
+                        evolved, circuit.num_qubits
+                    )
+                    if trace(evolved).real > 1e-15
+                    else {},
+                    branch="",
+                    environment_states=environment_states,
+                )
+            )
+    else:
+        combined = _combined_branch_trajectories(
+            circuit, groups, schedule, timeline
         )
+        for branch, pattern, weight, events, environment_states, record in combined:
+            branch_state, classical = _evolve(
+                circuit,
+                rules,
+                {branch: events},
+                schedule=schedule,
+                timeline=timeline,
+                only_branch=branch,
+            )
+            for row in range(size):
+                for col in range(size):
+                    state[row][col] += weight * branch_state[row][col]
+            for key, value in classical.items():
+                classical_total[key] = classical_total.get(key, 0.0) + weight * value
+            record_with_probability = dict(record)
+            record_with_probability["probability"] = weight
+            environment_records.append(record_with_probability)
+            trajectories.append(
+                NoiseTrajectory(
+                    label=f"{branch}:{pattern}" if branch else pattern,
+                    probability=weight,
+                    outcome_probabilities=measurement_probabilities(
+                        branch_state, circuit.num_qubits
+                    )
+                    if trace(branch_state).real > 1e-15
+                    else {},
+                    branch=branch,
+                    environment_states=environment_states,
+                )
+            )
 
     result = SimulationResult(
         state=state,
@@ -284,6 +348,8 @@ def _combined_branch_trajectories(
     groups: Sequence[CorrelatedNoiseGroup],
     schedule: Optional[TimeSchedule],
     timeline: EnvironmentTimeline,
+    environment_events: Sequence[EnvironmentEvent] = (),
+    event_cancellations: Sequence[EventCancellation] = (),
 ) -> list[
     tuple[
         str,
@@ -295,17 +361,52 @@ def _combined_branch_trajectories(
     ]
 ]:
     combined = []
+    plan = (
+        firing_plan(environment_events, schedule, event_cancellations)
+        if environment_events and schedule is not None
+        else {}
+    )
+    event_joint = (
+        event_joint_probabilities(environment_events) if environment_events else []
+    )
     for branch in _possible_registers(circuit):
         branch_key = "".join(str(bit) for bit in branch)
         experienced = _experienced_indices(circuit, branch, groups, schedule)
-        for pattern, weight, events, states, records in _combined_trajectories(
+        branch_active = set(range(len(circuit.operations)))
+        for index, operation in enumerate(circuit.operations):
+            if (
+                operation.condition is not None
+                and not _register_matches(branch, operation.condition)
+            ):
+                branch_active.discard(index)
+        noise_choices = _combined_trajectories(
             groups, experienced, schedule, timeline
-        ):
+        ) if groups else [("", 1.0, {}, {}, {})]
+        event_choices = event_joint or [([], 1.0)]
+        for noise_choice, event_choice in product(noise_choices, event_choices):
+            pattern, weight, events, states, records = noise_choice
+            event_bits, event_weight = event_choice
+            events = {index: list(operators) for index, operators in events.items()}
+            states = dict(states)
+            records = dict(records)
+            event_events, event_states, event_records = _events_to_error_map(
+                environment_events,
+                event_bits,
+                plan,
+                schedule,
+                branch_active,
+            )
+            for index, operators in event_events.items():
+                events.setdefault(index, []).extend(operators)
+            if event_states:
+                states.update(event_states)
+            if event_records:
+                records["environment_events"] = event_records
             combined.append(
                 (
                     branch_key,
                     pattern,
-                    weight,
+                    weight * event_weight,
                     events,
                     states,
                     {
@@ -321,6 +422,134 @@ def _combined_branch_trajectories(
                 )
             )
     return combined
+
+
+def _event_trajectory_entries(
+    circuit: Circuit,
+    groups: Sequence[CorrelatedNoiseGroup],
+    environment_events: Sequence[EnvironmentEvent],
+    plan: dict[int, list[tuple[int, EnvironmentEvent]]],
+    schedule: Optional[TimeSchedule],
+    timeline: EnvironmentTimeline,
+) -> list[
+    tuple[
+        str,
+        float,
+        dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+        dict[str, list[int]],
+        dict[str, object],
+    ]
+]:
+    """Enumerate one joint environment draw for the whole circuit.
+
+    Measurements split each realization into branches inside evolution, so
+    a firing before a measurement is never redrawn per branch.  When
+    correlated groups are also present their sites must all be reached
+    unconditionally (a site behind a conditional gate would require a
+    branch-specific draw, which would no longer be one shared realization).
+    """
+    has_measurement = any(
+        operation.name == "measure" for operation in circuit.operations
+    )
+    if groups and has_measurement:
+        unconditional = set(range(len(circuit.operations)))
+        for index, operation in enumerate(circuit.operations):
+            if operation.condition is not None:
+                unconditional.discard(index)
+        for group in groups:
+            for after_gate, _qubit in group.sites:
+                if after_gate not in unconditional:
+                    raise ValueError(
+                        "combining environment events with a correlated group site "
+                        "behind a conditional gate is not supported; split the study"
+                    )
+    event_choices = event_joint_probabilities(environment_events)
+    full_active = set(range(len(circuit.operations)))
+    entries: list[
+        tuple[
+            str,
+            float,
+            dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+            dict[str, list[int]],
+            dict[str, object],
+        ]
+    ] = []
+    experienced = _experienced_indices(circuit, (), groups, schedule)
+    group_choices = (
+        list(_combined_trajectories(groups, experienced, schedule, timeline))
+        if groups
+        else [("", 1.0, {}, {}, {})]
+    )
+    for event_bits, event_weight in event_choices:
+        event_events, event_states, event_records = _events_to_error_map(
+            environment_events, event_bits, plan, schedule, full_active
+        )
+        for pattern, group_weight, group_events, group_states, group_records in group_choices:
+            events = {index: list(operators) for index, operators in event_events.items()}
+            for index, operators in group_events.items():
+                events.setdefault(index, []).extend(operators)
+            states = dict(event_states)
+            states.update(group_states)
+            records = dict(group_records)
+            if event_records:
+                records["environment_events"] = event_records
+            entries.append(
+                (
+                    pattern,
+                    event_weight * group_weight,
+                    events,
+                    states,
+                    records,
+                )
+            )
+    return entries
+
+
+def _events_to_error_map(
+    environment_events: Sequence[EnvironmentEvent],
+    event_bits: Sequence[tuple[int, ...]],
+    plan: dict[int, list[tuple[int, EnvironmentEvent]]],
+    schedule: Optional[TimeSchedule],
+    branch_active: set[int],
+) -> tuple[
+    dict[int, list[tuple[Matrix, tuple[int, ...]]]],
+    dict[str, list[int]],
+    list[dict],
+]:
+    """Expand one shared realization per event into per-boundary operators."""
+    events: dict[int, list[tuple[Matrix, tuple[int, ...]]]] = {}
+    states: dict[str, list[int]] = {}
+    records: list[dict] = []
+    for event_index, event in enumerate(environment_events):
+        bits = event_bits[event_index]
+        flips = event.realization_flips(bits)
+        states[event.name] = list(flips)
+        for operation_index, ordered in plan.items():
+            if operation_index not in branch_active:
+                continue
+            if not any(index == event_index for index, _entry in ordered):
+                continue
+            firing_time = (
+                schedule.event_time(operation_index) if schedule is not None else None
+            )
+            records.append(
+                {
+                    "event": event.name,
+                    "operation": operation_index,
+                    "time": firing_time,
+                    "common_bit": bits[0],
+                    "independent_bits": list(bits[1:]),
+                    "qubit_flips": list(flips),
+                    "qubits": list(event.qubits),
+                }
+            )
+            for qubit, flip in zip(event.qubits, flips):
+                if flip:
+                    events.setdefault(operation_index, []).append(
+                        (event.error_operator, (qubit,))
+                    )
+    records.sort(key=lambda record: (record["operation"], record["event"]))
+    return events, states, records
 
 
 def _combined_trajectories(
@@ -493,11 +722,16 @@ def _evolve(
                     )
                 )
                 state = _apply_rule(state, effective_rule, circuit.num_qubits)
+        branch_events = {}
         if error_events and not isinstance(next(iter(error_events)), int):
             branch_key = "".join(str(bit) for bit in register)
             branch_events = error_events.get(branch_key, {})  # type: ignore[union-attr]
+            global_events = error_events.get("__shared__", {})  # type: ignore[union-attr]
         else:
-            branch_events = error_events  # type: ignore[assignment]
+            global_events = error_events  # type: ignore[assignment]
+        for operator, qubits in global_events.get(index, ()):  # type: ignore[union-attr]
+            unitary = embedding(operator, qubits, circuit.num_qubits)
+            state = _apply_unitary(state, unitary)
         for operator, qubits in branch_events.get(index, ()):  # type: ignore[union-attr]
             unitary = embedding(operator, qubits, circuit.num_qubits)
             state = _apply_unitary(state, unitary)
@@ -571,9 +805,16 @@ def compare_ideal_and_noisy(
     noise_model: NoiseModel,
     schedule: Optional[TimeSchedule] = None,
     timeline: Optional[EnvironmentTimeline] = None,
+    environment_events: Optional[Sequence[EnvironmentEvent]] = None,
+    event_cancellations: Optional[Sequence[EventCancellation]] = None,
 ) -> tuple[SimulationResult, SimulationResult]:
     return simulate(circuit, schedule=schedule, timeline=timeline), simulate(
-        circuit, noise_model, schedule=schedule, timeline=timeline
+        circuit,
+        noise_model,
+        schedule=schedule,
+        timeline=timeline,
+        environment_events=environment_events,
+        event_cancellations=event_cancellations,
     )
 
 
@@ -613,6 +854,15 @@ def _validate_groups(circuit: Circuit, groups: Sequence[CorrelatedNoiseGroup]) -
                 raise ValueError("correlated noise site points outside circuit operations")
             if not 0 <= qubit < circuit.num_qubits:
                 raise ValueError("correlated noise site targets a qubit outside circuit")
+
+
+def _validate_events(
+    circuit: Circuit, events: Sequence[EnvironmentEvent]
+) -> None:
+    for event in events:
+        for qubit in event.qubits:
+            if not 0 <= qubit < circuit.num_qubits:
+                raise ValueError("environment event targets a qubit outside circuit")
 
 
 def measurement_probabilities(state: Matrix, num_qubits: int) -> dict[str, float]:
@@ -671,7 +921,7 @@ def sample_counts_trajectory(
         raise ValueError("at least one noise trajectory is required")
     noise_rng = random.Random(noise_seed)
     measure_rng = random.Random(measure_seed)
-    weights = [trajectory.probability for trajectory in trajectories]
+    weights = [max(0.0, trajectory.probability) for trajectory in trajectories]
     total = sum(weights)
     if total <= 0:
         raise ValueError("noise trajectories have zero total probability")
@@ -692,6 +942,8 @@ def sample_counts_trajectory(
                 break
         else:
             trajectory = trajectories[-1]
+        if not trajectory.outcome_probabilities:
+            continue
         outcome = _draw_outcome(trajectory.outcome_probabilities, measure_rng)
         counts[outcome] += 1
     return counts

@@ -26,6 +26,7 @@ python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
 python examples/perturbation_timing_comparison.py
+python examples/environment_event_comparison.py
 ```
 
 命令行示例：
@@ -63,6 +64,33 @@ batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 2026100
 `Perturbation(start, end, probability=...)` 表示一段 `[start, end)` 的外部扰动；事件按 `TimeSchedule` 的实际时间取环境状态，落在空闲区间或操作中途都不会被推迟到下一次操作。`end` 边界恢复为基础环境，因此 `start == end` 的瞬时扰动是无效果的边界对照。多个扰动可重叠：高 `priority` 决定当前环境，同优先级以后加入者为准；扰动结束后自动恢复到基础条件或仍在生效的其他扰动。
 
 `ExperimentPrefix.fork(name, perturbations)` 从同一前缀派生不同扰动时刻的独立批次，并保留锚点之前已发生的扰动；尝试把新扰动写到锚点之前会报错。`ExperimentBatch.with_perturbations(...)` 用于没有共同历史约束的直接派生。暂停恢复可使用 `start_resumable_batch(..., pause_at_perturbation=(name, phase))`，阶段为 `start`、`overlap` 或 `end`；恢复时重放原批次，采样结果与直接执行及改变检查点执行顺序一致。`direct_perturbed_probabilities` 提供无扰动、持续扰动和半开区间瞬时边界的短线路直接对照。
+
+### 共同环境事件
+
+`EnvironmentEvent(start, end, qubits, common_probability=..., independent_probability=...)`
+表示一段 `[start, end)` 内同时作用于指定量子位的环境事件：
+
+- 每次事件实现只抽**一个**共同翻转（以 `common_probability` 作用于该事件的全部目标量子位），各量子位再独立抽取 `independent_probability` 的翻转；联合实现分布被精确枚举加权，绝不把共同项拆成各量子位重新抽样。
+- 事件在 `TimeSchedule` 的非测量操作边界触发；零持续时间（`start == end`）不触发任何边界；多个事件可只在部分时段重叠，同一边界按 `priority` 排序作用。
+- `EventCancellation(event_name, time)` 撤销该时刻之后尚未发生的触发；已经触发的实现保持不变，后续修改事件范围不会改写已归档研究。
+- `ExperimentBatch.with_environment_events(...)` 从同一批次派生互不共享可变状态的研究分支；归档保存事件定义、联合实现表与联合测量计数，重复种子完全复现。
+
+手算的二量子位结果（事件在末尾边界触发一次，p = 1/2）：
+
+- 完全共同翻转：P(00) = P(11) = 1/2，P(01) = P(10) = 0；
+- 完全独立翻转：P(00) = P(01) = P(10) = P(11) = 1/4；
+- 混合（共同、独立各 1/4）：P(00) = 7/16，其余结果各 3/16。
+
+三量子位示例中事件 A 作用于 (0, 1)、事件 B 作用于 (1, 2)，时间窗只在部分时段重叠；各事件共同翻转一次时最终分布集中在 101。
+
+### 中途测量后的两种续接
+
+`MeasurementStudy` 保存含中途测量的完整线路、时间表与测量时刻。研究者从该点：
+
+- `continue_observed()`：跨越测量点的事件保持同一个环境实现，续接沿用已经观察到的环境条件；
+- `continue_resampled()`：跨越测量点的事件在测量时刻截断，测量后生成新的、独立抽取的事件。
+
+两种续接都重放完整线路（前缀不可被后续事件改写），但联合分布不同。例如共同翻转概率 1/2 的事件在测量前后各触发一次时：沿用观察条件得到恒为 00（同一翻转作用两次），重新抽环境得到 P(00) = P(11) = 1/2。
 
 ## 最小代码示例
 

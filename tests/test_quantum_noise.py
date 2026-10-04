@@ -28,6 +28,8 @@ from quantum_noise.noise import (
     direct_perturbed_probabilities,
 )
 from quantum_noise.simulator import simulate, validate_density_matrix
+from quantum_noise.environment import EnvironmentEvent, EventCancellation
+from quantum_noise.experiments import MeasurementStudy
 
 
 class SimulatorTests(unittest.TestCase):
@@ -645,6 +647,153 @@ class PerturbationTests(unittest.TestCase):
         self.assertEqual(schedule_records[0]["time"], 1.0)
         self.assertEqual(schedule_records[1]["time"], 3.0)
         self.assertEqual(schedule_records[1]["restored_environment"], "baseline")
+
+
+class CommonEnvironmentEventTests(unittest.TestCase):
+    def identity_two_qubits(self):
+        circuit = Circuit(2).rx(0, 0.0).rx(1, 0.0)
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 0.0), "identity")
+        return circuit, schedule
+
+    def simulate_event(self, circuit, schedule, event, cancellations=()):
+        return simulate(
+            circuit,
+            NoiseModel("events"),
+            schedule,
+            environment_events=(event,),
+            event_cancellations=cancellations,
+        )
+
+    def test_common_independent_and_mixed_have_hand_computed_distributions(self):
+        circuit, schedule = self.identity_two_qubits()
+        window = (1.0 + 1e-9, 3.0)
+        common = self.simulate_event(
+            circuit, schedule, EnvironmentEvent(*window, (0, 1), 1.0, 0.0, name="e")
+        )
+        half_common = self.simulate_event(
+            circuit, schedule, EnvironmentEvent(*window, (0, 1), 0.5, 0.0, name="e")
+        )
+        independent = self.simulate_event(
+            circuit, schedule, EnvironmentEvent(*window, (0, 1), 0.0, 0.5, name="e")
+        )
+        mixed = self.simulate_event(
+            circuit, schedule, EnvironmentEvent(*window, (0, 1), 0.25, 0.25, name="e")
+        )
+        self.assertAlmostEqual(common.probabilities["11"], 1.0)
+        self.assertAlmostEqual(half_common.probabilities["00"], 0.5)
+        self.assertAlmostEqual(half_common.probabilities["11"], 0.5)
+        for outcome in ("00", "01", "10", "11"):
+            self.assertAlmostEqual(independent.probabilities[outcome], 0.25)
+        self.assertAlmostEqual(mixed.probabilities["00"], 7 / 16)
+        for outcome in ("01", "10", "11"):
+            self.assertAlmostEqual(mixed.probabilities[outcome], 3 / 16)
+
+    def test_common_component_is_not_resampled_per_qubit(self):
+        event = EnvironmentEvent(0.0, 5.0, (0, 1), common_probability=0.5)
+        realizations = dict(event.realizations())
+        # The shared draw must appear as one bit with both qubit flips equal.
+        self.assertAlmostEqual(realizations[(1, 0, 0)], 0.5)
+        self.assertAlmostEqual(realizations[(0, 0, 0)], 0.5)
+
+    def test_three_qubit_partially_overlapping_events(self):
+        circuit = Circuit(3).rx(0, 0.0).rx(1, 0.0).rx(2, 0.0).rx(0, 0.0)
+        schedule = TimeSchedule((1.0,) * 4, (0.0,) * 4, "four")
+        event_a = EnvironmentEvent(
+            1.0 + 1e-9, 2.5, (0, 1), common_probability=1.0, name="A"
+        )
+        event_b = EnvironmentEvent(
+            2.0 + 1e-9, 3.5, (1, 2), common_probability=1.0, name="B"
+        )
+        result = simulate(
+            circuit, NoiseModel("events"), schedule,
+            environment_events=(event_a, event_b),
+        )
+        self.assertAlmostEqual(result.probabilities["101"], 1.0)
+
+    def test_event_cancellation_only_removes_later_firings(self):
+        circuit = Circuit(3).rx(0, 0.0).rx(1, 0.0).rx(2, 0.0).rx(0, 0.0)
+        schedule = TimeSchedule((1.0,) * 4, (0.0,) * 4, "four")
+        event = EnvironmentEvent(
+            1.0 + 1e-9, 3.5, (0, 1), common_probability=1.0, name="lasting"
+        )
+        active = simulate(
+            circuit, NoiseModel("events"), schedule, environment_events=(event,)
+        )
+        cancelled = simulate(
+            circuit, NoiseModel("events"), schedule,
+            environment_events=(event,),
+            event_cancellations=(EventCancellation("lasting", 3.0),),
+        )
+        self.assertAlmostEqual(active.probabilities["000"], 1.0)
+        self.assertAlmostEqual(cancelled.probabilities["110"], 1.0)
+
+    def test_zero_duration_and_invalid_probabilities(self):
+        circuit = Circuit(2).rx(0, 0.0).rx(1, 0.0)
+        schedule = TimeSchedule((1.0, 1.0), (0.0, 0.0), "identity")
+        instant = EnvironmentEvent(2.0, 2.0, (0, 1), 1.0, name="instant")
+        result = self.simulate_event(circuit, schedule, instant)
+        self.assertAlmostEqual(result.probabilities["00"], 1.0)
+        with self.assertRaises(ValueError):
+            EnvironmentEvent(0.0, 1.0, (0,), common_probability=1.2)
+        with self.assertRaises(ValueError):
+            EnvironmentEvent(0.0, 1.0, (0,), independent_probability=-0.1)
+        with self.assertRaises(ValueError):
+            EnvironmentEvent(2.0, 1.0, (0,))
+
+    def test_observed_and_resampled_continuations_have_clear_meanings(self):
+        circuit = Circuit(2).rx(0, 0.0).measure(0, 0).rx(1, 0.0)
+        schedule = TimeSchedule((1.0, 1.0, 1.0), (0.0, 0.0, 0.0), "with-m")
+        storm = EnvironmentEvent(0.5, 3.5, (0, 1), common_probability=0.5, name="storm")
+        study = MeasurementStudy(
+            circuit, NoiseModel("events"), schedule, 2.0,
+            shots=400, base_seed=11, events=(storm,),
+        )
+        observed = run_batch(study.continue_observed())[0]
+        resampled = run_batch(study.continue_resampled())[0]
+        self.assertAlmostEqual(observed.noisy_probabilities["00"], 1.0)
+        self.assertAlmostEqual(resampled.noisy_probabilities["00"], 0.5)
+        self.assertAlmostEqual(resampled.noisy_probabilities["11"], 0.5)
+        with self.assertRaises(ValueError):
+            study.continue_observed(
+                [EnvironmentEvent(0.5, 1.5, (0, 1), name="rewrite")]
+            )
+
+    def test_archive_reproduces_samples_and_keeps_event_conditions(self):
+        circuit, schedule = self.identity_two_qubits()
+        event = EnvironmentEvent(1.0 + 1e-9, 3.0, (0, 1), 0.3, 0.2, name="storm")
+        batch = ExperimentBatch(
+            circuit, NoiseModel("events"), 600, 20261004,
+            name="mixed", schedule=schedule, environment_events=(event,),
+        )
+        runs = run_batch(batch, repeats=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.json"
+            save_batch_archive(path, batch, runs)
+            reproduced = rerun_archive(path)
+            self.assertEqual(
+                [run.noisy_counts for run in runs],
+                [run.noisy_counts for run in reproduced],
+            )
+            self.assertEqual(reproduced[0].environment_events[0], event)
+
+    def test_forks_do_not_share_mutable_event_state(self):
+        circuit, schedule = self.identity_two_qubits()
+        base = ExperimentBatch(
+            circuit, NoiseModel("events"), 1000, 31,
+            name="base", schedule=schedule,
+        )
+        common = base.with_environment_events(
+            [EnvironmentEvent(1.0 + 1e-9, 3.0, (0, 1), 0.5, name="e")],
+            name="common",
+        )
+        independent = base.with_environment_events(
+            [EnvironmentEvent(1.0 + 1e-9, 3.0, (0, 1), 0.0, 0.5, name="e")],
+            name="independent",
+        )
+        common_run = run_batch(common)[0]
+        independent_run = run_batch(independent)[0]
+        self.assertNotEqual(common_run.noisy_counts, independent_run.noisy_counts)
+        self.assertEqual(run_batch(common)[0].noisy_counts, common_run.noisy_counts)
 
 
 if __name__ == "__main__":
