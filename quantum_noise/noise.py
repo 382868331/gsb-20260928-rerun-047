@@ -293,6 +293,105 @@ _CORRELATED_ERROR_OPERATORS = {
 
 
 @dataclass(frozen=True)
+class JointEnvironmentEvent:
+    """A finite environmental event jointly exposing noise to named qubits."""
+
+    name: str
+    start: float
+    end: float
+    after_gate: int
+    qubits: tuple[int, ...]
+    common_probability: float = 0.0
+    independent_probability: float = 0.0
+    channel: str = "bit_flip"
+    cancelled: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("environment event requires a name")
+        if float(self.start) < 0.0:
+            raise ValueError("environment event start must be nonnegative")
+        if float(self.end) < float(self.start):
+            raise ValueError("environment event end must not precede its start")
+        if self.after_gate < 0:
+            raise ValueError("environment event gate index must be nonnegative")
+        if len(self.qubits) < 2:
+            raise ValueError("a joint environment event needs at least two qubits")
+        if len(set(self.qubits)) != len(self.qubits):
+            raise ValueError("environment event target qubits must be distinct")
+        if self.channel not in _CORRELATED_ERROR_OPERATORS:
+            raise ValueError(
+                "environment events support "
+                f"{sorted(_CORRELATED_ERROR_OPERATORS)}, not {self.channel!r}"
+            )
+        _probability(self.common_probability, "common environment probability")
+        _probability(self.independent_probability, "independent environment probability")
+
+    @property
+    def instantaneous(self) -> bool:
+        return float(self.end) == float(self.start)
+
+    def active_at(self, time: float) -> bool:
+        return not self.cancelled and float(self.start) <= float(time) < float(self.end)
+
+    def cancel(self) -> "JointEnvironmentEvent":
+        return JointEnvironmentEvent(
+            self.name,
+            self.start,
+            self.end,
+            self.after_gate,
+            self.qubits,
+            self.common_probability,
+            self.independent_probability,
+            self.channel,
+            True,
+        )
+
+    def trajectories(self) -> list[tuple[tuple[int, ...], float]]:
+        """Return exact joint error patterns for one active occurrence."""
+        c = self.common_probability
+        q = self.independent_probability
+        count = len(self.qubits)
+        results: list[tuple[tuple[int, ...], float]] = []
+        for value in range(2**count):
+            pattern = tuple((value >> (count - 1 - index)) & 1 for index in range(count))
+            flips = sum(pattern)
+            weight = (1.0 - c) * (q**flips) * ((1.0 - q) ** (count - flips))
+            if flips == count:
+                weight += c
+            if weight > 0.0:
+                results.append((pattern, weight))
+        return results
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "start": float(self.start),
+            "end": float(self.end),
+            "after_gate": int(self.after_gate),
+            "qubits": [int(qubit) for qubit in self.qubits],
+            "common_probability": float(self.common_probability),
+            "independent_probability": float(self.independent_probability),
+            "channel": self.channel,
+            "cancelled": bool(self.cancelled),
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, object]) -> "JointEnvironmentEvent":
+        return JointEnvironmentEvent(
+            name=str(data["name"]),
+            start=float(data["start"]),  # type: ignore[arg-type]
+            end=float(data["end"]),  # type: ignore[arg-type]
+            after_gate=int(data["after_gate"]),  # type: ignore[arg-type]
+            qubits=tuple(int(value) for value in data["qubits"]),  # type: ignore[arg-type]
+            common_probability=float(data.get("common_probability", 0.0)),  # type: ignore[arg-type]
+            independent_probability=float(data.get("independent_probability", 0.0)),  # type: ignore[arg-type]
+            channel=str(data.get("channel", "bit_flip")),
+            cancelled=bool(data.get("cancelled", False)),
+        )
+
+
+@dataclass(frozen=True)
 class TimeSchedule:
     """Physical timing of circuit operations and subsequent idle intervals.
 
@@ -462,6 +561,7 @@ class NoiseModel:
     name: str
     rules: Sequence[NoiseRule] = field(default_factory=tuple)
     groups: Sequence[CorrelatedNoiseGroup] = field(default_factory=tuple)
+    environment_events: Sequence[JointEnvironmentEvent] = field(default_factory=tuple)
 
     def to_dict(self) -> dict:
         return {
@@ -477,6 +577,7 @@ class NoiseModel:
                 for rule in self.rules
             ],
             "groups": [group.to_dict() for group in self.groups],
+            "environment_events": [event.to_dict() for event in self.environment_events],
         }
 
     @staticmethod
@@ -496,5 +597,9 @@ class NoiseModel:
             groups=tuple(
                 CorrelatedNoiseGroup.from_dict(item)
                 for item in data.get("groups", [])
+            ),
+            environment_events=tuple(
+                JointEnvironmentEvent.from_dict(item)
+                for item in data.get("environment_events", [])
             ),
         )

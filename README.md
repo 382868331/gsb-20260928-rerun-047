@@ -8,7 +8,9 @@
 - 物理噪声：`bit_flip`、`phase_flip`、`depolarizing`、`amplitude_damping`、通用 Pauli 通道。
  - 顺序有效：`NoiseRule(after_gate=...)` 按线路门索引插入；同一位置的多条规则按列表顺序执行。
 - 时间相关噪声：`CorrelatedNoiseGroup` 用两态马尔可夫链耦合多个线路位置的错误事件，相关强度 `correlation` 从 0（独立）到 1（完全相关）；联合噪声轨迹被精确枚举并加权混合，绝不用独立重复抽样代替相关过程。
+- 共同环境事件：`JointEnvironmentEvent` 在半开持续时间窗 `[start, end)` 内一次性抽取共同 Bernoulli 条件，并把 `bit_flip`/`phase_flip` 同时作用于指定量子位；另可叠加每量子位独立条件。共同项、独立项和混合项分别保留为完整联合测量分布。
 - 中途测量与条件操作：`Circuit.measure(qubit, cbit)` 在经典寄存器上分裂分支，`Circuit.apply(..., condition=(cbit, value))` 只在匹配分支上作用。
+- 中途测量续接：`save_mid_measurement_continuation` 保存已观察经典分支、锚点时间和已发生联合环境条件；`MidMeasurementContinuation.continue_batch("observed")` 固定这些条件，`continue_batch("resample")` 只让后续事件重新抽样，新增事件不得早于锚点。
 - 随机性可追溯：相关噪声批次中，每个 shot 先按 `noise_seed` 抽噪声轨迹、再按 `measure_seed` 抽测量结果，两种随机性分开追溯、分别可复现；运行结果记录噪声轨迹分布。
 - 时间安排与持续扰动：`TimeSchedule` 为每个操作和随后的空闲区间指定时间；相关组使用有限 `correlation_time`，相关随两次环境事件的实际间隔指数衰减。
 - 分支独立环境：中途测量后的每个经典分支单独延续环境状态；条件门被跳过时，不会只因为分支操作数量相同就共享扰动历史。
@@ -26,6 +28,7 @@ python examples/bell_short_correlation.py
 python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
 python examples/perturbation_timing_comparison.py
+python examples/joint_environment_comparison.py
 ```
 
 命令行示例：
@@ -63,6 +66,29 @@ batch = ExperimentBatch(circuit, NoiseModel("time", (), (group,)), 2000, 2026100
 `Perturbation(start, end, probability=...)` 表示一段 `[start, end)` 的外部扰动；事件按 `TimeSchedule` 的实际时间取环境状态，落在空闲区间或操作中途都不会被推迟到下一次操作。`end` 边界恢复为基础环境，因此 `start == end` 的瞬时扰动是无效果的边界对照。多个扰动可重叠：高 `priority` 决定当前环境，同优先级以后加入者为准；扰动结束后自动恢复到基础条件或仍在生效的其他扰动。
 
 `ExperimentPrefix.fork(name, perturbations)` 从同一前缀派生不同扰动时刻的独立批次，并保留锚点之前已发生的扰动；尝试把新扰动写到锚点之前会报错。`ExperimentBatch.with_perturbations(...)` 用于没有共同历史约束的直接派生。暂停恢复可使用 `start_resumable_batch(..., pause_at_perturbation=(name, phase))`，阶段为 `start`、`overlap` 或 `end`；恢复时重放原批次，采样结果与直接执行及改变检查点执行顺序一致。`direct_perturbed_probabilities` 提供无扰动、持续扰动和半开区间瞬时边界的短线路直接对照。
+
+### 共同环境与独立环境对照
+
+```python
+event = JointEnvironmentEvent(
+    name="pulse",
+    start=1.0,
+    end=3.0,
+    after_gate=1,
+    qubits=(0, 1),
+    common_probability=0.2,
+    independent_probability=0.1,
+)
+model = NoiseModel("mixed-environment", (), (), (event,))
+```
+
+二量子位 `|00>` 在事件点后的精确分布可手算：
+
+- 完全共同翻转 `c=0.2, q=0`：`P(00)=0.8`，`P(11)=0.2`。
+- 完全独立翻转 `c=0, q=0.1`：`P(00)=0.81`，`P(01)=P(10)=0.09`，`P(11)=0.01`。
+- 混合 `c=0.2, q=0.1`：`P(00)=0.648`，`P(01)=P(10)=0.072`，`P(11)=0.208`。
+
+模拟器枚举的是联合模式 `00/01/10/11`；`11` 的共同分量不会拆成两个量子位分别抽样。`start == end` 或 `event.cancel()` 后事件无效果；共同/独立概率必须位于 `[0, 1]`。
 
 ## 最小代码示例
 

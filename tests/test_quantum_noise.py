@@ -10,9 +10,11 @@ from quantum_noise.experiments import (
     ExperimentPrefix,
     compare_schedules,
     load_batch,
+    load_mid_measurement_continuation,
     rerun_archive,
     resume_batch,
     run_batch,
+    save_mid_measurement_continuation,
     save_batch_archive,
     save_schedule_comparison,
     start_resumable_batch,
@@ -23,6 +25,7 @@ from quantum_noise.noise import (
     EnvironmentTimeline,
     NoiseModel,
     NoiseRule,
+    JointEnvironmentEvent,
     Perturbation,
     TimeSchedule,
     direct_perturbed_probabilities,
@@ -645,6 +648,175 @@ class PerturbationTests(unittest.TestCase):
         self.assertEqual(schedule_records[0]["time"], 1.0)
         self.assertEqual(schedule_records[1]["time"], 3.0)
         self.assertEqual(schedule_records[1]["restored_environment"], "baseline")
+
+
+class JointEnvironmentEventTests(unittest.TestCase):
+    def two_qubit_circuit(self):
+        return Circuit(2).rx(0, 0.0).rx(1, 0.0)
+
+    def run_event(self, common_probability=0.0, independent_probability=0.0):
+        event = JointEnvironmentEvent(
+            name="pulse",
+            start=0.0,
+            end=2.5,
+            after_gate=1,
+            qubits=(0, 1),
+            common_probability=common_probability,
+            independent_probability=independent_probability,
+        )
+        schedule = TimeSchedule((1.0, 1.0), name="two-gates")
+        model = NoiseModel("joint", (), (), (event,))
+        return simulate(self.two_qubit_circuit(), model, schedule), event
+
+    def test_common_independent_and_mixed_joint_distributions(self):
+        common, common_event = self.run_event(common_probability=0.2)
+        independent, independent_event = self.run_event(independent_probability=0.1)
+        mixed, mixed_event = self.run_event(common_probability=0.2, independent_probability=0.1)
+
+        self.assertEqual(common_event.trajectories(), [((0, 0), 0.8), ((1, 1), 0.2)])
+        expected = independent_event.trajectories()
+        self.assertEqual([pattern for pattern, _weight in expected], [(0, 0), (0, 1), (1, 0), (1, 1)])
+        for weight, wanted in zip((weight for _pattern, weight in expected), (0.81, 0.09, 0.09, 0.01)):
+            self.assertAlmostEqual(weight, wanted)
+        self.assertAlmostEqual(common.probabilities["00"], 0.8)
+        self.assertAlmostEqual(common.probabilities["11"], 0.2)
+        self.assertAlmostEqual(independent.probabilities["00"], 0.81)
+        self.assertAlmostEqual(independent.probabilities["01"], 0.09)
+        self.assertAlmostEqual(independent.probabilities["10"], 0.09)
+        self.assertAlmostEqual(independent.probabilities["11"], 0.01)
+        self.assertAlmostEqual(mixed.probabilities["00"], 0.648)
+        self.assertAlmostEqual(mixed.probabilities["01"], 0.072)
+        self.assertAlmostEqual(mixed.probabilities["10"], 0.072)
+        self.assertAlmostEqual(mixed.probabilities["11"], 0.208)
+        labels = {trajectory.label: trajectory.probability for trajectory in mixed.noise_trajectories}
+        self.assertEqual(set(labels), {"pulse=00", "pulse=01", "pulse=10", "pulse=11"})
+        self.assertAlmostEqual(sum(labels.values()), 1.0)
+
+    def test_fully_common_flip_is_one_joint_trajectory(self):
+        result, _event = self.run_event(common_probability=1.0)
+        self.assertEqual(
+            {trajectory.label: trajectory.probability for trajectory in result.noise_trajectories},
+            {"pulse=11": 1.0},
+        )
+        self.assertAlmostEqual(result.probabilities["11"], 1.0)
+
+    def test_joint_event_archive_round_trip_reproduces_counts(self):
+        result, event = self.run_event(common_probability=0.2, independent_probability=0.1)
+        batch = ExperimentBatch(
+            circuit=self.two_qubit_circuit(),
+            noise_model=NoiseModel("mixed", (), (), (event,)),
+            shots=256,
+            base_seed=424,
+            name="mixed",
+            schedule=TimeSchedule((1.0, 1.0), name="two-gates"),
+        )
+        runs = run_batch(batch, repeats=2)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "joint.json"
+            save_batch_archive(path, batch, runs)
+            reproduced = rerun_archive(path)
+        self.assertEqual(
+            [run.noisy_counts for run in runs],
+            [run.noisy_counts for run in reproduced],
+        )
+        self.assertAlmostEqual(sum(result.probabilities.values()), 1.0)
+
+    def test_three_qubit_events_can_partially_overlap(self):
+        circuit = Circuit(3).rx(0, 0.0).rx(1, 0.0).rx(2, 0.0)
+        first = JointEnvironmentEvent("common-01", 0.0, 2.5, 1, (0, 1), common_probability=1.0)
+        second = JointEnvironmentEvent("independent-12", 2.0, 3.5, 2, (1, 2), independent_probability=0.5)
+        result = simulate(
+            circuit,
+            NoiseModel("partial-overlap", (), (), (first, second)),
+            TimeSchedule((1.0, 1.0, 1.0), name="three-gates"),
+        )
+        for outcome in ("100", "101", "110", "111"):
+            self.assertAlmostEqual(result.probabilities[outcome], 0.25)
+        labels = {trajectory.label for trajectory in result.noise_trajectories}
+        self.assertEqual(labels, {
+            "common-01=11-independent-12=00",
+            "common-01=11-independent-12=01",
+            "common-01=11-independent-12=10",
+            "common-01=11-independent-12=11",
+        })
+
+    def test_zero_duration_and_cancellation_have_no_effect(self):
+        zero = JointEnvironmentEvent("zero", 2.0, 2.0, 1, (0, 1), common_probability=1.0)
+        cancelled = JointEnvironmentEvent(
+            "cancelled", 0.0, 2.5, 1, (0, 1), common_probability=1.0
+        ).cancel()
+        schedule = TimeSchedule((1.0, 1.0), name="two-gates")
+        circuit = self.two_qubit_circuit()
+        zero_result = simulate(circuit, NoiseModel("zero", (), (), (zero,)), schedule)
+        cancelled_result = simulate(circuit, NoiseModel("cancelled", (), (), (cancelled,)), schedule)
+        for result in (zero_result, cancelled_result):
+            self.assertAlmostEqual(result.probabilities["00"], 1.0)
+            self.assertAlmostEqual(result.probabilities["11"], 0.0)
+        self.assertTrue(cancelled.cancelled)
+        self.assertTrue(zero.instantaneous)
+
+    def test_invalid_event_probabilities_are_rejected(self):
+        with self.assertRaises(ValueError):
+            JointEnvironmentEvent("bad", 0.0, 1.0, 0, (0, 1), common_probability=1.1)
+        with self.assertRaises(ValueError):
+            JointEnvironmentEvent("bad", 0.0, 1.0, 0, (0, 1), independent_probability=-0.1)
+
+    def test_observed_and_resampled_continuations_have_distinct_meaning(self):
+        circuit = Circuit(2).h(0).measure(0, 0).x(1)
+        schedule = TimeSchedule((1.0, 1.0, 1.0), name="prefix-and-suffix")
+        pulse = JointEnvironmentEvent("observed-pulse", 0.0, 2.5, 1, (0, 1), common_probability=0.5)
+        prefix = ExperimentBatch(
+            circuit,
+            NoiseModel("prefix", (), (), (pulse,)),
+            shots=128,
+            base_seed=909,
+            name="prefix",
+            schedule=schedule,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continuation.json"
+            saved = save_mid_measurement_continuation(
+                path,
+                prefix,
+                measurement_condition=(0,),
+                anchor_time=2.0,
+                observed_environment={"observed-pulse": (1, 1)},
+            )
+            loaded = load_mid_measurement_continuation(path)
+            observed_run = run_batch(loaded.continue_batch("observed", name="observed", base_seed=111))[0]
+            resampled_run = run_batch(loaded.continue_batch("resample", name="resample", base_seed=222))[0]
+            self.assertAlmostEqual(observed_run.noisy_probabilities["10"], 1.0)
+            self.assertAlmostEqual(resampled_run.noisy_probabilities["01"], 0.5)
+            self.assertAlmostEqual(resampled_run.noisy_probabilities["10"], 0.5)
+            self.assertEqual(saved.observed_environment, loaded.observed_environment)
+            with self.assertRaises(ValueError):
+                loaded.continue_batch(
+                    "observed",
+                    additional_events=[JointEnvironmentEvent("rewrite", 1.0, 2.5, 2, (0, 1), common_probability=1.0)],
+                )
+
+    def test_saved_continuation_does_not_mutate_from_caller(self):
+        circuit = Circuit(2).h(0).measure(0, 0).x(1)
+        schedule = TimeSchedule((1.0, 1.0, 1.0), name="prefix-and-suffix")
+        event = JointEnvironmentEvent("pulse", 0.0, 2.5, 1, (0, 1), common_probability=1.0)
+        prefix = ExperimentBatch(
+            circuit,
+            NoiseModel("prefix", (), (), (event,)),
+            shots=64,
+            base_seed=321,
+            name="prefix",
+            schedule=schedule,
+        )
+        observed = {"pulse": (0, 0)}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "continuation.json"
+            saved = save_mid_measurement_continuation(path, prefix, (0,), 2.0, observed)
+            observed["pulse"] = (1, 1)
+            self.assertEqual(saved.observed_environment["pulse"], (0, 0))
+            with self.assertRaises(TypeError):
+                saved.observed_environment["pulse"] = (1, 1)
+            loaded = load_mid_measurement_continuation(path)
+            self.assertEqual(loaded.observed_environment["pulse"], (0, 0))
 
 
 if __name__ == "__main__":

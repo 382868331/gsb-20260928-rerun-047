@@ -6,13 +6,25 @@ import hashlib
 import json
 import os
 import random
+from types import MappingProxyType
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Sequence
 
 from .gates import Circuit, CNOT, CZ, H, S, SWAP, X, Y, Z, rx, ry, rz
-from .noise import EnvironmentTimeline, NoiseModel, Perturbation, TimeSchedule
-from .simulator import compare_ideal_and_noisy, sample_counts, sample_counts_trajectory
+from .noise import (
+    EnvironmentTimeline,
+    JointEnvironmentEvent,
+    NoiseModel,
+    Perturbation,
+    TimeSchedule,
+)
+from .simulator import (
+    compare_ideal_and_noisy,
+    sample_counts,
+    sample_counts_trajectory,
+    simulate,
+)
 from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportions
 
 
@@ -28,6 +40,8 @@ class ExperimentBatch:
     name: str = "experiment"
     schedule: Optional[TimeSchedule] = None
     timeline: Optional[EnvironmentTimeline] = None
+    forced_environment: Optional[dict[str, tuple[int, ...]]] = None
+    measurement_condition: Optional[tuple[int, ...]] = None
 
     def seeds(self, repeats: int) -> list[int]:
         if repeats <= 0:
@@ -65,6 +79,8 @@ class ExperimentBatch:
             name=name or self.name,
             schedule=self.schedule,
             timeline=EnvironmentTimeline(tuple(perturbations)),
+            forced_environment=self.forced_environment,
+            measurement_condition=self.measurement_condition,
         )
 
 
@@ -104,6 +120,191 @@ class ExperimentPrefix:
             schedule=self.batch.schedule,
             timeline=timeline,
         )
+
+
+@dataclass(frozen=True)
+class MidMeasurementContinuation:
+    """Saved prefix state for observed-condition versus fresh-environment runs."""
+
+    prefix: ExperimentBatch
+    measurement_condition: tuple[int, ...]
+    observed_environment: Mapping[str, tuple[int, ...]]
+    anchor_time: float
+
+    def __post_init__(self) -> None:
+        if self.prefix.schedule is None:
+            raise ValueError("mid-measurement continuation requires a schedule")
+        if self.anchor_time < 0.0:
+            raise ValueError("anchor_time must be nonnegative")
+        if not self.measurement_condition or any(bit not in (0, 1) for bit in self.measurement_condition):
+            raise ValueError("measurement_condition must contain observed classical bits")
+        for name, pattern in self.observed_environment.items():
+            if any(bit not in (0, 1) for bit in pattern):
+                raise ValueError(f"observed pattern for {name!r} must contain bits")
+        event_pattern_lengths = {
+            event.name: len(event.qubits)
+            for event in self.prefix.noise_model.environment_events
+        }
+        schedule = self.prefix.normalized_schedule
+        active_before_anchor = {
+            event.name
+            for event in self.prefix.noise_model.environment_events
+            if schedule is not None
+            and schedule.event_time(event.after_gate) <= self.anchor_time
+            and event.active_at(schedule.event_time(event.after_gate))
+        }
+        if set(self.observed_environment) != active_before_anchor:
+            raise ValueError(
+                "observed environment must include every active joint event "
+                "before the continuation anchor and no future event"
+            )
+        for name, pattern in self.observed_environment.items():
+            if name not in event_pattern_lengths or len(pattern) != event_pattern_lengths[name]:
+                raise ValueError(f"observed pattern for {name!r} does not match its event")
+        object.__setattr__(
+            self,
+            "observed_environment",
+            MappingProxyType(dict(self.observed_environment)),
+        )
+
+    def continue_batch(
+        self,
+        mode: str,
+        *,
+        name: Optional[str] = None,
+        shots: Optional[int] = None,
+        base_seed: Optional[int] = None,
+        additional_events: Sequence[JointEnvironmentEvent] = (),
+    ) -> ExperimentBatch:
+        if mode not in ("observed", "resample"):
+            raise ValueError("continuation mode must be 'observed' or 'resample'")
+        for event in additional_events:
+            if event.start < self.anchor_time:
+                raise ValueError(
+                    f"cannot add event {event.name!r} before the saved continuation anchor"
+                )
+        model = self.prefix.noise_model
+        if additional_events:
+            names = {event.name for event in model.environment_events}
+            names.update(event.name for event in additional_events)
+            if len(names) != len(tuple(model.environment_events)) + len(tuple(additional_events)):
+                raise ValueError("additional environment events must have unique names")
+            model = NoiseModel(
+                name=model.name,
+                rules=model.rules,
+                groups=model.groups,
+                environment_events=tuple(model.environment_events) + tuple(additional_events),
+            )
+        forced = dict(self.observed_environment) if mode == "observed" else None
+        return ExperimentBatch(
+            circuit=self.prefix.circuit,
+            noise_model=model,
+            shots=shots if shots is not None else self.prefix.shots,
+            base_seed=base_seed if base_seed is not None else self.prefix.base_seed,
+            name=name or f"{self.prefix.name}-{mode}",
+            schedule=self.prefix.schedule,
+            timeline=self.prefix.timeline,
+            forced_environment=forced,
+            measurement_condition=self.prefix.measurement_condition or self.measurement_condition,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": ARCHIVE_SCHEMA_VERSION,
+            "kind": "mid_measurement_continuation",
+            "anchor_time": self.anchor_time,
+            "measurement_condition": list(self.measurement_condition),
+            "observed_environment": {
+                name: list(pattern)
+                for name, pattern in self.observed_environment.items()
+            },
+            "batch": _batch_payload(self.prefix),
+        }
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(
+            json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    @classmethod
+    def load(cls, path: str | Path) -> "MidMeasurementContinuation":
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if data.get("kind") != "mid_measurement_continuation":
+            raise ValueError("file is not a mid-measurement continuation")
+        return cls(
+            prefix=_batch_from_payload(data["batch"]),
+            measurement_condition=tuple(int(bit) for bit in data["measurement_condition"]),
+            observed_environment={
+                name: tuple(int(bit) for bit in pattern)
+                for name, pattern in data["observed_environment"].items()
+            },
+            anchor_time=float(data["anchor_time"]),
+        )
+
+
+def save_mid_measurement_continuation(
+    path: str | Path,
+    prefix: ExperimentBatch,
+    measurement_condition: tuple[int, ...],
+    anchor_time: float,
+    observed_environment: Optional[dict[str, tuple[int, ...]]] = None,
+    seed: Optional[int] = None,
+) -> MidMeasurementContinuation:
+    if observed_environment is None:
+        result = simulate(
+            prefix.circuit,
+            prefix.noise_model,
+            prefix.normalized_schedule,
+            prefix.normalized_timeline,
+            measurement_condition=measurement_condition,
+        )
+        branch_key = "".join(str(int(bit)) for bit in measurement_condition)
+        choices = []
+        for record in result.environment_records or ():
+            if record.get("branch") != branch_key:
+                continue
+            joint_probability = float(record.get("joint_branch_probability", 0.0))
+            if joint_probability <= 0.0:
+                continue
+            active_patterns = {}
+            for event in prefix.noise_model.environment_events:
+                entries = record.get("events", {}).get(event.name, [])
+                active_entries = [
+                    entry
+                    for entry in entries
+                    if entry.get("active") and entry.get("time") is not None
+                    and float(entry["time"]) <= anchor_time
+                ]
+                if active_entries:
+                    active_patterns[event.name] = tuple(int(bit) for bit in active_entries[-1]["pattern"])
+            choices.append((joint_probability, active_patterns))
+        if not choices:
+            raise ValueError("measurement condition has no nonzero environment trajectory")
+        total = sum(weight for weight, _pattern in choices)
+        rng = random.Random(seed)
+        point = rng.random() * total
+        cumulative = 0.0
+        selected = choices[-1][1]
+        for weight, pattern in choices:
+            cumulative += weight
+            if point <= cumulative:
+                selected = pattern
+                break
+        observed_environment = selected
+
+    observed = dict(observed_environment)
+    continuation = MidMeasurementContinuation(
+        prefix=prefix,
+        measurement_condition=measurement_condition,
+        observed_environment=observed,
+        anchor_time=anchor_time,
+    )
+    continuation.save(path)
+    return continuation
+
+
+def load_mid_measurement_continuation(path: str | Path) -> MidMeasurementContinuation:
+    return MidMeasurementContinuation.load(path)
 
 
 @dataclass(frozen=True)
@@ -172,9 +373,14 @@ def run_batch(
         else None
     )
     ideal_result, noisy_result = compare_ideal_and_noisy(
-        batch.circuit, batch.noise_model, schedule, batch.normalized_timeline
+        batch.circuit,
+        batch.noise_model,
+        schedule,
+        batch.normalized_timeline,
+        batch.forced_environment,
+        batch.measurement_condition,
     )
-    correlated = bool(batch.noise_model.groups)
+    correlated = bool(batch.noise_model.groups or batch.noise_model.environment_events)
     trajectory_records = None
     if correlated:
         trajectory_records = [
@@ -267,6 +473,15 @@ def save_batch_archive(
             "noise_model": batch.noise_model.to_dict(),
             "schedule": batch.schedule.to_dict() if batch.schedule is not None else None,
             "timeline": batch.normalized_timeline.to_list(),
+            "forced_environment": None
+            if batch.forced_environment is None
+            else {
+                name: list(pattern)
+                for name, pattern in batch.forced_environment.items()
+            },
+            "measurement_condition": None
+            if batch.measurement_condition is None
+            else list(batch.measurement_condition),
         },
         "runs": [run.to_dict() for run in runs],
     }
@@ -277,8 +492,12 @@ def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if payload.get("schema_version") not in (1, 2, ARCHIVE_SCHEMA_VERSION):
         raise ValueError("unsupported batch archive schema")
-    data = payload["batch"]
-    batch = ExperimentBatch(
+    batch = _batch_from_payload(payload["batch"])
+    return batch, payload["runs"]
+
+
+def _batch_from_payload(data: dict[str, Any]) -> ExperimentBatch:
+    return ExperimentBatch(
         circuit=circuit_from_dict(data["circuit"]),
         noise_model=NoiseModel.from_dict(data["noise_model"]),
         shots=int(data["shots"]),
@@ -288,8 +507,16 @@ def load_batch(path: str | Path) -> tuple[ExperimentBatch, list[dict[str, Any]]]
         if data.get("schedule") is not None
         else None,
         timeline=EnvironmentTimeline.from_list(data.get("timeline")),
+        forced_environment=None
+        if data.get("forced_environment") is None
+        else {
+            name: tuple(int(bit) for bit in pattern)
+            for name, pattern in data["forced_environment"].items()
+        },
+        measurement_condition=None
+        if data.get("measurement_condition") is None
+        else tuple(int(bit) for bit in data["measurement_condition"]),
     )
-    return batch, payload["runs"]
 
 
 def rerun_archive(path: str | Path) -> list[BatchRun]:
@@ -374,6 +601,15 @@ def _batch_payload(batch: ExperimentBatch) -> dict[str, Any]:
         if batch.normalized_schedule is not None
         else None,
         "timeline": batch.normalized_timeline.to_list(),
+        "forced_environment": None
+        if batch.forced_environment is None
+        else {
+            name: list(pattern)
+            for name, pattern in batch.forced_environment.items()
+        },
+        "measurement_condition": None
+        if batch.measurement_condition is None
+        else list(batch.measurement_condition),
     }
 
 
@@ -478,6 +714,15 @@ class ResumableBatch:
             if batch_data.get("schedule") is not None
             else None,
             timeline=EnvironmentTimeline.from_list(batch_data.get("timeline")),
+            forced_environment=None
+            if batch_data.get("forced_environment") is None
+            else {
+                name: tuple(int(bit) for bit in pattern)
+                for name, pattern in batch_data["forced_environment"].items()
+            },
+            measurement_condition=None
+            if batch_data.get("measurement_condition") is None
+            else tuple(int(bit) for bit in batch_data["measurement_condition"]),
         )
         execution = cls(
             path=Path(path),
