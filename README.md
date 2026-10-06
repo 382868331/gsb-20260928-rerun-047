@@ -29,6 +29,7 @@ python examples/correlated_strength_sweep.py
 python examples/time_schedule_comparison.py
 python examples/perturbation_timing_comparison.py
 python examples/joint_environment_comparison.py
+python examples/perturbation_identification.py
 ```
 
 命令行示例：
@@ -89,6 +90,16 @@ model = NoiseModel("mixed-environment", (), (), (event,))
 - 混合 `c=0.2, q=0.1`：`P(00)=0.648`，`P(01)=P(10)=0.072`，`P(11)=0.208`。
 
 模拟器枚举的是联合模式 `00/01/10/11`；`11` 的共同分量不会拆成两个量子位分别抽样。`start == end` 或 `event.cancel()` 后事件无效果；共同/独立概率必须位于 `[0, 1]`。
+
+### 共同扰动与独立扰动辨识
+
+`quantum_noise.identification` 根据联合测量计数区分共同扰动与独立扰动。研究者提供二至三量子位线路、`TimeSchedule`、计数数据和若干 `CandidateWindow` 候选事件时窗；`fit_event_models` 在合法概率范围 `[0, 1]` 内网格扫描每个时窗的 `(common_probability, independent_probability)`，用精确多项对数似然评分完全共同、完全独立与混合三类模型：
+
+- 混合类嵌套另外两类，因此类间比较使用 AIC（与最优类差距小于 2 的类保留）；类内参数组合按似然比阈值保留为可选解释。
+- 样本不足（期望计数过低）、多个时窗同样拟合（参数不可辨识）或多类模型同时保留时，结果为 `inconclusive`，所有存留解释及其依据都记录在 `reasons` 中。
+- 各比特边际相同不能宣称模型等价：当最优共同拟合与最优独立拟合的边际在采样误差内一致、但联合分布的总变差距离超出采样误差时，结果附带 `marginals_warning`。
+
+`predict_joint_distribution` 把选中的候选组合放到新线路上预测联合分布，`test_prediction` 用追加的独立样本检验该预测，样本不足时报告 `inconclusive`。`PerturbationStudy` 把研究绑定到原始线路、时窗和计数；后续证据必须声明 `"observed"`（沿已观察结果继续）或 `"resample"`（重新抽样）模式，`pooled_counts` 只合并同一模式，两种模式的证据不能混用，`identify()` 始终只使用原始计数。
 
 ## 最小代码示例
 

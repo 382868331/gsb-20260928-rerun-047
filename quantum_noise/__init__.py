@@ -18,6 +18,18 @@ from .experiments import (
     start_resumable_batch,
 )
 from .gates import Circuit, bell_circuit, ghz_circuit
+from .identification import (
+    CandidateWindow,
+    EvidenceRecord,
+    FittedModel,
+    IdentificationResult,
+    OutcomeDeviation,
+    PerturbationStudy,
+    PredictionTest,
+    fit_event_models,
+    predict_joint_distribution,
+    test_prediction,
+)
 from .noise import (
     CorrelatedNoiseGroup,
     EnvironmentTimeline,
@@ -40,16 +52,23 @@ from .stats import DifferenceTest, ProportionEstimate, compare_counts, proportio
 
 __all__ = [
     "BatchRun",
+    "CandidateWindow",
     "Circuit",
     "CorrelatedNoiseGroup",
     "DifferenceTest",
+    "EvidenceRecord",
     "ExperimentBatch",
     "ExperimentPrefix",
+    "FittedModel",
+    "IdentificationResult",
     "JointEnvironmentEvent",
     "MidMeasurementContinuation",
     "NoiseModel",
     "NoiseRule",
+    "OutcomeDeviation",
     "Perturbation",
+    "PerturbationStudy",
+    "PredictionTest",
     "EnvironmentTimeline",
     "direct_perturbed_probabilities",
     "NoiseTrajectory",
@@ -64,7 +83,9 @@ __all__ = [
     "bell_circuit",
     "compare_counts",
     "compare_ideal_and_noisy",
+    "fit_event_models",
     "ghz_circuit",
+    "predict_joint_distribution",
     "proportions",
     "run_batch",
     "save_mid_measurement_continuation",
@@ -75,4 +96,5 @@ __all__ = [
     "start_resumable_batch",
     "simulate",
     "SimulationResult",
+    "test_prediction",
 ]
